@@ -7,7 +7,7 @@ const { createKeepalive } = require('../lib/keepalive');
 const { createNetProbe } = require('../lib/netprobe');
 
 const SERVER_NAME = 'instabox-matrix';
-const SERVER_VERSION = '1.0.0';
+const SERVER_VERSION = '1.1.0';
 
 function log(message) {
   try { process.stderr.write(`[instabox-matrix-mcp] ${message}\n`); } catch { /* ignore */ }
@@ -900,7 +900,7 @@ async function handle(request) {
         protocolVersion: (params && params.protocolVersion) || '2024-11-05',
         capabilities: { tools: {} },
         serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
-        instructions: 'Instabox machine control. Account aliases live in ~/.openchamber-instabox-matrix/state.json and are managed from the Instabox Matrix panel in OpenChamber.',
+        instructions: 'Instabox machine control for multiple accounts: machines, power, exec/jobs, snapshots, ports, files, network info, keepalive, SSH tokens and desktop links. Account aliases live in ~/.openchamber-instabox-matrix/state.json and are managed from the Instabox Matrix panel in OpenChamber.',
       },
     });
   }

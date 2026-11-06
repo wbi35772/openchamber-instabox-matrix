@@ -1,99 +1,126 @@
 # Instabox Matrix
 
-OpenChamber 扩展：多账号 Instabox 机器矩阵面板 + 本地服务代理 + MCP Agent 工具。
-
-零依赖、零构建：没有 `node_modules`，没有打包步骤，`panel/main.js` 是可读的经典 IIFE，安装后直接加载。
+OpenChamber 扩展：在一个面板里管理多个 Instabox 账号的沙盒机器，并通过本地服务代理和 MCP 工具把这些能力交给 Agent。API Key 只保存在本地服务状态文件中，永远不会进入面板页面或浏览器存储。
 
 ## 功能
 
-- **多账号矩阵**：每个账号一个别名 + `ibk_…` API Key，可切换或聚合查看。
-- **机器卡片**：状态、规格、模板、数据盘、空闲暂停、最长运行、快照序号，浅色状态条 + 绿色运行态。
-- **SSH 端点**：读取 `/connection-info`，一键复制 `ssh -p PORT USER@HOST`。
-- **公网端口**：列出、发布、取消发布 HTTP/TCP 端口，复制公开 URL 与私有 token URL。
-- **快照**：创建、列出、删除、恢复到机器（带确认）。
-- **命令执行**：`bash -lc`，可设超时、是否写入历史，展示 stdout / stderr / 退出码。
-- **Keepalive**：本地守护按间隔对运行中的机器执行一次空命令，避免空闲暂停；可逐机开关与调间隔。
-- **交给 Agent**：把机器上下文 attach 到 OpenChamber 会话并追加任务提示。
-- **本地服务**：面板不直接联网。服务持有 API Key，绑定 `127.0.0.1`，每个请求校验 `Bearer` token。
-- **网关字段**：可把 `api.instabox.sh` 指到本地反代 / CORS 网关，全局或按账号覆盖。
+- **多账号矩阵**：每个账号一行，机器卡片显示状态、规格、数据盘、到期与 IP。
+- **机器操作**：启动、停止、暂停、恢复、重启、删除（需输入名称确认），以及创建与克隆（模板、等待 operation）。
+- **活动租约**：自动为运行中的机器续租，空闲暂停后由 exec / 终端流量唤醒。
+- **命令执行**：同步 `exec`，长命令自动转异步 job（30 秒阈值），8 MB 响应上限。
+- **文件管理**：列目录、读写文本、预览、≤5 MiB 直接下载，大文件走上传/下载链接。
+- **快照与端口**：创建/恢复/删除快照，列出与开放公网端口。
+- **SSH Token**：生成一次性登录命令（1 小时 / 24 小时 / 7 天 / 永久），列表与撤销。
+- **桌面**：安装/启动/接管/交还桌面，生成只读、可过期的浏览器链接并轮询状态。
+- **Web 终端**：详情里的 xterm 终端，250 ms 轮询、输入/缩放、持久 shell 重连回放。
+- **MCP 工具**：14 个工具，覆盖机器、执行、文件、快照、网络、SSH、桌面与终端之外的常用操作。
+- **本地服务代理**：面板只访问 `127.0.0.1` 上的服务，服务持有 Key 并直连 Instabox Gateway。
 
 ## 安装
 
+推荐用同步脚本（幂等，支持只检查不写入）：
+
 ```powershell
-$src = "D:\Project\Openchamber\初始配置\openchamber-instabox-matrix"
-$dst = Join-Path $env:USERPROFILE ".config\openchamber\extensions\instabox-matrix"
-New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
-Copy-Item -Recurse -Force $src $dst
+node scripts/sync.mjs
 ```
 
-1. 重启 OpenChamber（或 设置 → 扩展 → 刷新列表）。
-2. 设置 → 扩展 → **Instabox Matrix** → 允许本地服务（`service`）。未授权时面板会提示 `NO_SERVICE`。
-3. 打开面板，点“添加账号”，填别名与 API Key；可勾选保存前验证。
-4. 若账号在免费套餐，机器空闲 30 分钟会暂停；打开 Keepalive 可保活。
+默认安装到 `%USERPROFILE%\.config\openchamber\extensions\instabox-matrix`，并更新 `%USERPROFILE%\.config\openchamber\extensions.json`（注册 zip 来源、服务能力与作用域、去重旧路径键）。自定义位置：
 
-状态文件：`~/.openchamber-instabox-matrix/state.json`（`600`，含 API Key，不要提交或分享）。
-可用 `INSTABOX_MATRIX_DATA_DIR` 覆盖目录。
+```powershell
+node scripts/sync.mjs --install-dir "D:\OpenChamber\extensions\instabox-matrix" --registry "D:\OpenChamber\extensions.json"
+node scripts/sync.mjs --check
+```
 
-## Agent 工具（MCP）
+然后**重启 OpenChamber**。首次使用：
 
-MCP 服务在 `mcp/server.js`，stdin/stdout JSON-RPC，零依赖。把它注册到 OpenCode 配置（`C:\Users\24999\.config\opencode\opencode.json`）：
+1. 打开 Instabox Matrix 面板。
+2. 「添加账号」，填别名与 `ibk_...` API Key（可选自定义 Gateway）。
+3. 机器出现在矩阵后即可操作。
+
+扩展由 OpenChamber 宿主启动本地服务；不需要单独运行守护进程。
+
+### 状态文件
+
+`~/.openchamber-instabox-matrix/state.json`（权限 600），保存账号、别名、Gateway 覆盖、租约与少量缓存。里面有 API Key，不要提交到仓库。用 `INSTABOX_MATRIX_DATA_DIR` 可改数据目录。
+
+## MCP
+
+在 OpenCode 配置中加：
 
 ```json
 {
   "mcp": {
-    "servers": {
-      "instabox-matrix": {
-        "type": "local",
-        "command": [
-          "C:\\Users\\24999\\.local\\tools\\node\\node.exe",
-          "C:\\Users\\24999\\.config\\openchamber\\extensions\\instabox-matrix\\mcp\\server.js"
-        ],
-        "enabled": true
-      }
+    "instabox-matrix": {
+      "type": "local",
+      "command": ["<NODE_EXE>", "<EXTENSION_DIR>/mcp/server.js"],
+      "enabled": true
     }
   }
 }
 ```
 
-工具：
+MCP 服务直接读取状态文件并访问 Instabox API，不依赖面板或本地 HTTP 服务。
 
 | 工具 | 作用 |
 | --- | --- |
-| `instabox_list_machines` | 列出一个 / 全部账号的机器、状态、规格、keepalive |
-| `instabox_power_action` | `start` / `stop` / `suspend` / `resume` / `wake` / `delete`（需 `confirm`） |
-| `instabox_exec_command` | 在运行中的机器执行 `bash -lc` 命令，返回 stdout/stderr/exitCode |
-| `instabox_manage_snapshot` | 列出 / 创建 / 删除 / 恢复快照 |
-| `instabox_expose_port` | 列出 / 发布 / 取消发布公网端口 |
-| `instabox_list_accounts` | 列出已配置别名、Key 指纹、组织、验证状态 |
+| `instabox_list_machines` | 列出账号下的机器 |
+| `instabox_power_action` | status / start / stop / pause / resume / restart |
+| `instabox_exec_command` | 同步或异步执行命令 |
+| `instabox_manage_snapshot` | list / create / restore / delete |
+| `instabox_expose_port` | list / expose / unexpose |
+| `instabox_keepalive` | status / arm / renew / release |
+| `instabox_network_info` | 探测运行时 IP |
+| `instabox_inspect` | metrics / logs / history / processes |
+| `instabox_create_machine` | 从模板创建机器 |
+| `instabox_fork_machine` | 克隆机器 |
+| `instabox_list_accounts` | 列出已配置账号 |
+| `instabox_files` | list / read / write / download / upload_url |
+| `instabox_ssh_token` | list / create / revoke / revoke_all |
+| `instabox_desktop` | status / install / start / takeover / handback / stream / stream_state / stream_revoke |
 
-`account` 省略时用第一个启用的账号；传 `all` 表示全部。
+## 面板
 
-## API 行为要点
+机器详情有 8 个 tab：概览、访问、文件、终端、指标、日志、历史、进程。切换或关闭会停止轮询并清理终端会话；关闭弹窗不会留下后台定时器。
 
-- 认证：`X-API-Key: ibk_…`。
-- 生命周期 / 快照 / 恢复请求带 `Idempotency-Key`。
-- 删除机器与快照带 `X-Confirm-Delete: <id 或完整名称>`。
-- 创建/启动/停止/暂停/恢复/还原返回 `202 + Operation`；面板展示 `operationId`，服务端不阻塞轮询。
-- 错误体 `{error:{code,message,requestId,retryable}}`，面板按 `code` 给出中文提示。
+## 限制
 
-## 目录
+- 免费计划 1 台机器、200 GiB 数据、5 个快照；创建/克隆可能返回 `429 quota_exceeded`。
+- 服务响应上限 8,000,000 字节；大文件必须用链接方式，不能走服务内存。
+- 公网 IP 只在机器运行时可见。
+- SSH Token 最长 2,592,000 秒；`noExpiry` 与 `ttlSeconds` 互斥。
+- 桌面链接默认只读，有到期时间；没有桌面 `stop` 动作，撤销链接或停止机器即可。
+- 终端为轮询实现，单用户单会话，空闲 2 分钟回收；立即重连（<1 秒）可能拿到空回放。
+- xterm 资源本地自带（@xterm/xterm 5.5.0、@xterm/addon-fit 0.10.0，MIT）。
 
+## API 行为备注
+
+- 认证：`X-API-Key: ibk_...`；生命周期与快照写操作需要 `Idempotency-Key`。
+- 删除需要 `X-Confirm-Delete`；错误统一为 `{error:{code,message,details?,requestId}}`。
+- 异步操作返回 202 + `Operation`，轮询到 `succeeded` / `failed`。
+- 终端 WebSocket 用 `X-API-Key` 升级，PTY 二进制双向；控制消息为 JSON。
+
+## 开发
+
+无依赖、无构建，Node 22+：
+
+```powershell
+node --test          # 全部测试
+node --check lib\ws.js
+node scripts/sync.mjs --check
 ```
-package.json          OpenChamber 清单（panel + service + tool 样式）
-icon.svg
-panel/index.html      面板入口
-panel/style.css       深色 Linear/Vercel 风格
-panel/main.js         IIFE，所有交互
-service/main.js       本地 HTTP 服务（127.0.0.1 + Bearer）
-lib/instabox.js       Instabox 客户端（零依赖 fetch）
-lib/store.js          账号 / 设置 / keepalive 状态
-lib/keepalive.js      保活调度
-mcp/server.js         MCP stdio 服务
+
+目录：
+
+```text
+lib/         Instabox 客户端、WebSocket、终端会话、租约、任务、状态存储
+service/     本地 HTTP 服务（面板 → 127.0.0.1 → Gateway）
+panel/       面板（IIFE + xterm vendor）
+mcp/         MCP stdio 服务
+scripts/     sync.mjs
+tests/       node:test
+docs/        VERIFICATION.md 端到端验收清单
 ```
 
-## 已知边界
+## License
 
-- Instabox 没有 IPv4/IPv6 字段；面板显示 `/connection-info` 的 SSH 主机与端口。
-- 面板内不存 Key；Key 只在服务进程与 `state.json` 中。
-- 机器处于 `creating/starting/stopping/suspending/resuming/deleting` 时不提供电源按钮，避免 409。
-- 免费套餐限制：1 台机器、5 个快照、200 GiB 存储、30 分钟空闲暂停。
+MIT
