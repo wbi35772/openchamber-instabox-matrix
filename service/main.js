@@ -5,6 +5,7 @@ const crypto = require('node:crypto');
 const store = require('../lib/store');
 const { InstaboxClient, InstaboxError } = require('../lib/instabox');
 const { createKeepalive } = require('../lib/keepalive');
+const { createJobs } = require('../lib/jobs');
 
 const PORT = Number(process.env.OPENCHAMBER_SERVICE_PORT || 0);
 const TOKEN = String(process.env.OPENCHAMBER_SERVICE_TOKEN || '');
@@ -21,6 +22,7 @@ if (!PORT || !TOKEN) {
 }
 
 const keepalive = createKeepalive({ log });
+const jobs = createJobs();
 const portCache = new Map();
 
 function send(res, status, payload, extraHeaders = {}) {
@@ -313,6 +315,19 @@ async function route(req, res, url) {
     return send(res, 200, { ok: true, patches });
   }
 
+  if (method === 'GET' && parts[0] === 'api' && parts[1] === 'jobs' && parts[2]) {
+    const job = jobs.get(decodeURIComponent(parts[2]));
+    if (!job) throw new InstaboxError('任务不存在或已过期', { code: 'job_not_found', status: 404 });
+    return send(res, 200, {
+      ok: true,
+      status: job.status,
+      result: job.result,
+      error: job.error,
+      startedAt: job.startedAt,
+      endedAt: job.endedAt,
+    });
+  }
+
   if (method === 'GET' && path === '/api/overview') {
     return send(res, 200, await overview(store.load(), query.account || ''));
   }
@@ -379,11 +394,12 @@ async function route(req, res, url) {
       const body = await readBody(req);
       const cmd = String(body.cmd || '').trim();
       if (!cmd) throw new InstaboxError('缺少要执行的命令', { code: 'missing_cmd', status: 400 });
-      const result = await client.exec(machineId, cmd, {
-        timeoutSeconds: Math.max(1, Math.min(600, Number(body.timeoutSeconds) || 60)),
-        noHistory: Boolean(body.noHistory),
-      });
-      return send(res, 200, { ok: true, result });
+      const timeoutSeconds = Math.max(1, Math.min(600, Number(body.timeoutSeconds) || 60));
+      const job = jobs.start(
+        () => client.exec(machineId, cmd, { timeoutSeconds, noHistory: Boolean(body.noHistory) }),
+        { alias, machineId, cmd, timeoutSeconds },
+      );
+      return send(res, 202, { ok: true, jobId: job.id, status: job.status, startedAt: job.startedAt });
     }
 
     if (rest[0] === 'ports' && rest.length === 1) {

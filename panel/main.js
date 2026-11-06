@@ -1149,11 +1149,21 @@
     if (status) { status.className = 'status-line'; status.innerHTML = '<span class="spinner"></span><span class="grow">执行中，最长 ' + timeout + ' 秒…</span>'; }
     await withButton(button, async function () {
       try {
-        var data = await service('POST', '/api/machines/' + encodeURIComponent(alias) + '/' + encodeURIComponent(machineId) + '/exec', {
+        var started = await service('POST', '/api/machines/' + encodeURIComponent(alias) + '/' + encodeURIComponent(machineId) + '/exec', {
           body: { cmd: cmd, timeoutSeconds: timeout, noHistory: noHistory },
-          timeoutMs: (timeout + 30) * 1000,
+          timeoutMs: 15000,
         });
-        var result = data.result || {};
+        var jobId = started.jobId;
+        var deadline = Date.now() + (timeout + 15) * 1000;
+        var job = null;
+        while (Date.now() < deadline) {
+          await new Promise(function (resolve) { setTimeout(resolve, 700); });
+          job = await service('GET', '/api/jobs/' + encodeURIComponent(jobId), { timeoutMs: 15000 });
+          if (job.status !== 'running') break;
+        }
+        if (!job || job.status === 'running') throw new Error('执行超时：任务仍在运行，可稍后重试或缩短命令');
+        if (job.status === 'error') throw new Error(typeof job.error === 'string' ? job.error : (job.error && job.error.message) || '任务失败');
+        var result = job.result || {};
         if (status) {
           var ok = result.exitCode === 0 && !result.timedOut;
           status.className = 'status-line ' + (ok ? 'ok' : 'bad');
