@@ -346,6 +346,7 @@
     lastRefresh: 0,
     modal: null,
     modalBusy: false,
+    templatesByAccount: {},
   };
 
   var gridEl = null;
@@ -844,6 +845,7 @@
       actions.push('<button class="action-btn" data-act="ports"' + attrs + '>' + icon('plug') + '端口</button>');
     }
     if (!busy) {
+      actions.push('<button class="action-btn" data-act="fork"' + attrs + '>' + icon('copy') + '克隆</button>');
       actions.push('<button class="action-btn danger" data-act="delete"' + attrs + ' data-name="' + esc(machine.name || '') + '">' + icon('trash') + '删除</button>');
     }
     return actions;
@@ -887,6 +889,8 @@
     var spec = state.modal;
     if (!spec) { root.innerHTML = ''; return; }
     if (spec.kind === 'account') return renderAccountModal(root, spec);
+    if (spec.kind === 'create') return renderCreateModal(root, spec);
+    if (spec.kind === 'fork') return renderForkModal(root, spec);
     if (spec.kind === 'settings') return renderSettingsModal(root, spec);
     if (spec.kind === 'exec') return renderExecModal(root, spec);
     if (spec.kind === 'snapshots') return renderSnapshotsModal(root, spec);
@@ -924,6 +928,204 @@
     root.innerHTML = modalShell(editing ? ('编辑账号 · ' + spec.alias) : '添加 Instabox 账号', 'agent', body, actions.join(''));
   }
 
+  function renderCreateModal(root, spec) {
+    var alias = spec.alias || (state.selected !== 'all' ? state.selected : (state.accounts[0] ? state.accounts[0].alias : ''));
+    var accountOptions = state.accounts.map(function (account) {
+      return '<option value="' + esc(account.alias) + '"' + (account.alias === alias ? ' selected' : '') + '>' + esc(account.alias) + '</option>';
+    }).join('');
+    var body = [
+      '<div class="form-grid two">',
+      field('账号', '<select class="select" id="create-account">' + accountOptions + '</select>'),
+      field('模板', '<select class="select" id="create-template"><option value="">读取模板…</option></select>'),
+      field('名称（可留空）', '<input class="input mono" id="create-name" maxlength="63" placeholder="留空自动生成 box-…" />'),
+      field('vCPU（可留空）', '<input class="input mono" id="create-vcpus" type="number" min="1" step="1" placeholder="模板默认" />'),
+      field('内存 MiB（可留空）', '<input class="input mono" id="create-mem" type="number" min="1" step="1" placeholder="模板默认" />'),
+      field('系统盘 GiB（可留空）', '<input class="input mono" id="create-root" type="number" min="1" step="1" placeholder="模板默认" />'),
+      field('数据盘 GiB（可留空）', '<input class="input mono" id="create-data" type="number" min="1" step="1" placeholder="模板默认" />'),
+      field('启动状态', '<select class="select" id="create-state"><option value="running">运行</option><option value="stopped">停止</option></select>'),
+      field('空闲暂停（秒）', '<input class="input mono" id="create-suspend" type="number" min="0" step="60" placeholder="模板默认" />'),
+      field('最长运行（分钟）', '<input class="input mono" id="create-maxrun" type="number" min="1" step="1" placeholder="不限" />'),
+      '</div>',
+      '<div class="hint" id="create-hint">留空的规格由模板默认值决定。</div>',
+    ].join('');
+    root.innerHTML = modalShell('新建机器', 'plus', body, [
+      '<button class="ghost-btn" data-act="close-modal">取消</button>',
+      '<button class="primary-btn" data-act="submit-create">' + icon('check') + '创建</button>',
+    ].join(''), true);
+    if (alias) loadTemplates(alias);
+  }
+
+  function renderForkModal(root, spec) {
+    var machine = spec.machine;
+    var source = machine.spec || {};
+    var body = [
+      '<div class="status-line"><span class="grow">' + esc(machine.name || machine.id) + '</span><span class="tag">' + esc(machine.account) + '</span></div>',
+      '<div class="form-grid two">',
+      field('新名称', '<input class="input mono" id="fork-name" maxlength="63" value="' + esc(suggestForkName(machine)) + '" />'),
+      field('vCPU（可留空）', '<input class="input mono" id="fork-vcpus" type="number" min="1" step="1" placeholder="' + esc(source.vcpus || '继承源机器') + '" />'),
+      field('内存 MiB（可留空）', '<input class="input mono" id="fork-mem" type="number" min="1" step="1" placeholder="' + esc(source.memMiB || '继承源机器') + '" />'),
+      '</div>',
+      '<div class="hint">克隆会创建一台独立机器，源机器的磁盘内容会复制过去。</div>',
+    ].join('');
+    root.innerHTML = modalShell('克隆机器', 'copy', body, [
+      '<button class="ghost-btn" data-act="close-modal">取消</button>',
+      '<button class="primary-btn" data-act="submit-fork" data-account="' + esc(machine.account) + '" data-machine="' + esc(machine.id) + '">' + icon('copy') + '克隆</button>',
+    ].join(''), true);
+    setTimeout(function () {
+      var input = $('#fork-name');
+      if (input) { input.focus(); input.select(); }
+    }, 30);
+  }
+
+  function suggestForkName(machine) {
+    var base = String(machine.name || machine.id || 'box').toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
+    if (!/^[a-z0-9]/.test(base)) base = 'box-' + base;
+    return ((base + '-copy').slice(0, 63).replace(/-+$/g, '')) || 'box-copy';
+  }
+
+  async function loadTemplates(alias) {
+    var select = $('#create-template');
+    if (!select) return;
+    var hint = $('#create-hint');
+    select.innerHTML = '<option value="">读取模板…</option>';
+    try {
+      var data = await service('GET', '/api/templates', { query: { account: alias }, timeoutMs: 45000 });
+      var account = (data.accounts || [])[0];
+      if (!account || !account.ok) {
+        throw new Error(account && account.error ? account.error.message : '读取模板失败');
+      }
+      var templates = account.templates || [];
+      state.templatesByAccount[alias] = templates;
+      if (!templates.length) {
+        select.innerHTML = '<option value="">没有可用模板</option>';
+        if (hint) hint.textContent = '这个账号没有可创建机器的模板。';
+        return;
+      }
+      select.innerHTML = templates.map(function (template) {
+        var label = template.id + (template.version ? ' ' + template.version : '') + (template.default ? ' · 默认' : '');
+        return '<option value="' + esc(template.id) + '" data-version="' + esc(template.version || '') + '">' + esc(label) + '</option>';
+      }).join('');
+      prefillTemplate(select);
+      if (hint) hint.textContent = '留空的规格由模板默认值决定；当前共 ' + templates.length + ' 个模板。';
+    } catch (error) {
+      select.innerHTML = '<option value="">读取失败</option>';
+      if (hint) hint.textContent = describeError(error);
+    }
+  }
+
+  function prefillTemplate(select) {
+    var alias = ($('#create-account') || {}).value || '';
+    var list = state.templatesByAccount[alias] || [];
+    var template = list.find(function (item) { return item.id === select.value; });
+    var spec = (template && template.defaultSpec) || {};
+    setInputValue('#create-vcpus', spec.vcpus);
+    setInputValue('#create-mem', spec.memMiB);
+    setInputValue('#create-root', spec.rootDiskGiB);
+    setInputValue('#create-data', spec.persistentDiskGiB);
+  }
+
+  function setInputValue(selector, value) {
+    var input = $(selector);
+    if (!input) return;
+    input.value = value === undefined || value === null ? '' : String(value);
+  }
+
+  async function submitCreate(button) {
+    var alias = ($('#create-account') || {}).value || '';
+    if (!alias) { toast('先选择账号', 'error'); return; }
+    var payload = { account: alias };
+    var name = (($('#create-name') || {}).value || '').trim();
+    if (name) payload.name = name;
+    var templateId = ($('#create-template') || {}).value || '';
+    if (templateId) {
+      payload.templateId = templateId;
+      var option = $('#create-template option:checked');
+      if (option && option.dataset.version) payload.templateVersion = option.dataset.version;
+    }
+    var fields = [
+      ['#create-vcpus', 'vcpus'],
+      ['#create-mem', 'memMiB'],
+      ['#create-root', 'rootDiskGiB'],
+      ['#create-data', 'persistentDiskGiB'],
+      ['#create-suspend', 'autoSuspendAfterSeconds'],
+      ['#create-maxrun', 'maxRunMinutes'],
+    ];
+    for (var i = 0; i < fields.length; i += 1) {
+      var input = $(fields[i][0]);
+      if (!input || input.value === '') continue;
+      var number = Number(input.value);
+      if (!Number.isInteger(number) || number < 0) {
+        toast('规格必须是整数', 'error');
+        input.focus();
+        return;
+      }
+      payload[fields[i][1]] = number;
+    }
+    var desired = ($('#create-state') || {}).value;
+    if (desired) payload.desiredState = desired;
+    await withButton(button, async function () {
+      var started = await service('POST', '/api/machines', { body: payload, timeoutMs: 30000 });
+      closeModal();
+      toast('创建已提交：' + (started.operationId || ''), 'success');
+      void watchOperation(alias, started.operationId, '创建');
+    });
+  }
+
+  async function submitFork(button) {
+    var alias = button.dataset.account;
+    var machineId = button.dataset.machine;
+    var name = (($('#fork-name') || {}).value || '').trim();
+    if (!name) { toast('新名称不能为空', 'error'); return; }
+    var payload = { name: name };
+    var vcpusInput = $('#fork-vcpus');
+    if (vcpusInput && vcpusInput.value !== '') {
+      var vcpus = Number(vcpusInput.value);
+      if (!Number.isInteger(vcpus) || vcpus < 1) { toast('vCPU 必须是 >= 1 的整数', 'error'); return; }
+      payload.vcpus = vcpus;
+    }
+    var memInput = $('#fork-mem');
+    if (memInput && memInput.value !== '') {
+      var mem = Number(memInput.value);
+      if (!Number.isInteger(mem) || mem < 1) { toast('内存必须是 >= 1 的整数', 'error'); return; }
+      payload.memMiB = mem;
+    }
+    await withButton(button, async function () {
+      var started = await service('POST', '/api/machines/' + encodeURIComponent(alias) + '/' + encodeURIComponent(machineId) + '/fork', { body: payload, timeoutMs: 30000 });
+      closeModal();
+      toast('克隆已提交：' + (started.operationId || ''), 'success');
+      void watchOperation(alias, started.operationId, '克隆');
+    });
+  }
+
+  async function watchOperation(alias, operationId, label) {
+    if (!operationId) return;
+    var deadline = Date.now() + 180000;
+    while (Date.now() < deadline) {
+      await new Promise(function (resolve) { setTimeout(resolve, 2000); });
+      var data;
+      try {
+        data = await service('GET', '/api/operations/' + encodeURIComponent(alias) + '/' + encodeURIComponent(operationId), { timeoutMs: 20000 });
+      } catch (error) {
+        toast(label + '状态读取失败：' + describeError(error), 'error');
+        return;
+      }
+      var operation = data.operation || null;
+      if (operation && operation.state === 'succeeded') {
+        toast(label + '完成' + (operation.machineId ? '：' + operation.machineId : ''), 'success');
+        refresh({ silent: true });
+        return;
+      }
+      if (operation && operation.state === 'failed') {
+        var detail = operation.error || {};
+        toast(label + '失败：' + (detail.message || detail.code || '未知错误'), 'error');
+        refresh({ silent: true });
+        return;
+      }
+    }
+    toast(label + '仍在进行，面板会自动刷新', 'info');
+    refresh({ silent: true });
+  }
+
   function renderSettingsModal(root) {
     var body = [
       '<div class="form-grid">',
@@ -931,7 +1133,7 @@
       '<div class="hint">所有账号的请求默认走这个地址；单个账号可以覆盖。通过本地反代或 CORS 网关时填这里。</div>',
       field('默认 Lease TTL（分钟）', '<input class="input mono" id="setting-keepalive-ttl" type="number" min="1" max="60" step="1" value="' + esc(Math.round((state.settings.defaultTtlSeconds || 900) / 60)) + '" />'),
       '<div class="divider"></div>',
-      '<div class="hint"><b>Agent 工具</b><br />MCP 服务注册到 <code>opencode.json</code> 的 <code>mcp.servers.instabox-matrix</code> 后可用：<br /><code>instabox_list_machines</code> · <code>instabox_power_action</code> · <code>instabox_exec_command</code> · <code>instabox_manage_snapshot</code> · <code>instabox_expose_port</code> · <code>instabox_keepalive</code> · <code>instabox_list_accounts</code></div>',
+      '<div class="hint"><b>Agent 工具</b><br />MCP 服务注册到 <code>opencode.json</code> 的 <code>mcp.servers.instabox-matrix</code> 后可用：<br /><code>instabox_list_machines</code> · <code>instabox_create_machine</code> · <code>instabox_fork_machine</code> · <code>instabox_power_action</code> · <code>instabox_exec_command</code> · <code>instabox_manage_snapshot</code> · <code>instabox_expose_port</code> · <code>instabox_keepalive</code> · <code>instabox_network_info</code> · <code>instabox_inspect</code> · <code>instabox_list_accounts</code></div>',
       '<div class="hint">本机状态文件：<code>~/.openchamber-instabox-matrix/state.json</code>（权限 600，含 API Key，不要提交或分享）。</div>',
       '</div>',
     ].join('');
@@ -1804,6 +2006,14 @@
       if (act === 'probe-net-all') { probeNetwork(null, el); return; }
       if (act === 'settings') { openModal({ kind: 'settings' }); return; }
       if (act === 'add-account') { openModal({ kind: 'account' }); return; }
+      if (act === 'create-machine') {
+        if (!state.accounts.length) { openModal({ kind: 'account' }); return; }
+        openModal({ kind: 'create' });
+        return;
+      }
+      if (act === 'fork') { openModal({ kind: 'fork', machine: machineFrom(el) }); return; }
+      if (act === 'submit-create') { submitCreate(el); return; }
+      if (act === 'submit-fork') { submitFork(el); return; }
       if (act === 'edit-account') {
         var chip = el.closest('[data-act="pick-account"]');
         if (chip) event.stopPropagation();
@@ -1872,6 +2082,9 @@
     });
 
     document.addEventListener('change', function (event) {
+      var target = event.target;
+      if (target && target.id === 'create-account') { loadTemplates(target.value); return; }
+      if (target && target.id === 'create-template') { prefillTemplate(target); return; }
       var el = event.target.closest('[data-change]');
       if (!el) return;
       if (el.dataset.change === 'keepalive-toggle') toggleKeepalive(el);

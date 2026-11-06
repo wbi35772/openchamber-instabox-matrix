@@ -213,6 +213,48 @@ const TOOLS = [
     },
   },
   {
+    name: 'instabox_create_machine',
+    description: 'Create a sandbox from a template or snapshot, then wait for the create operation to finish.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: '1-63 lowercase letters, digits or hyphens; omit for box-xxxxxxxx.' },
+        template_id: { type: 'string', description: 'Template ID, optionally id@version.' },
+        template_version: { type: 'string', description: 'Template version when template_id has no @version.' },
+        snapshot_id: { type: 'string', description: 'Create from a snapshot instead of a template.' },
+        vcpus: { type: 'integer', minimum: 1 },
+        mem_mib: { type: 'integer', minimum: 1 },
+        root_disk_gib: { type: 'integer', minimum: 1 },
+        persistent_disk_gib: { type: 'integer', minimum: 1 },
+        desired_state: { type: 'string', enum: ['running', 'stopped'] },
+        auto_suspend_after_seconds: { type: 'integer', minimum: 0 },
+        max_run_minutes: { type: 'integer', minimum: 1 },
+        account: { type: 'string', description: 'Account alias; omit for the active account.' },
+        wait: { type: 'boolean', description: 'Wait for the operation; default true.' },
+        timeout_seconds: { type: 'integer', minimum: 10, maximum: 600, description: 'Wait budget; default 180.' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'instabox_fork_machine',
+    description: 'Clone a sandbox into a new independent sandbox, then wait for the fork operation to finish.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        machine_id: { type: 'string', description: 'Source sandbox ID or name.' },
+        name: { type: 'string', description: 'New sandbox name, required.' },
+        vcpus: { type: 'integer', minimum: 1 },
+        mem_mib: { type: 'integer', minimum: 1 },
+        account: { type: 'string', description: 'Account alias; omit for the active account.' },
+        wait: { type: 'boolean', description: 'Wait for the operation; default true.' },
+        timeout_seconds: { type: 'integer', minimum: 10, maximum: 600 },
+      },
+      required: ['machine_id', 'name'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'instabox_list_accounts',
     description: 'List configured Instabox account aliases, key fingerprints, organizations and verification status.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
@@ -540,6 +582,54 @@ async function inspectTool(args) {
   return fail(`未知 kind：${kind}`);
 }
 
+async function createMachineTool(args) {
+  const state = store.load();
+  const account = resolveAccount(state, args.account);
+  const api = client(account, state);
+  const payload = {};
+  const fields = {
+    name: 'name',
+    template_id: 'templateId',
+    template_version: 'templateVersion',
+    snapshot_id: 'snapshotId',
+    vcpus: 'vcpus',
+    mem_mib: 'memMiB',
+    root_disk_gib: 'rootDiskGiB',
+    persistent_disk_gib: 'persistentDiskGiB',
+    desired_state: 'desiredState',
+    auto_suspend_after_seconds: 'autoSuspendAfterSeconds',
+    max_run_minutes: 'maxRunMinutes',
+  };
+  for (const [from, to] of Object.entries(fields)) {
+    if (args[from] !== undefined && args[from] !== '') payload[to] = args[from];
+  }
+  const operation = await api.createMachine(payload);
+  return operationResult(api, operation, args, '创建');
+}
+
+async function forkMachineTool(args) {
+  const state = store.load();
+  const account = resolveAccount(state, args.account);
+  const api = client(account, state);
+  const payload = { name: String(args.name || '').trim() };
+  if (args.vcpus !== undefined) payload.vcpus = args.vcpus;
+  if (args.mem_mib !== undefined) payload.memMiB = args.mem_mib;
+  const operation = await api.forkMachine(args.machine_id, payload);
+  return operationResult(api, operation, args, '克隆');
+}
+
+async function operationResult(api, operation, args, label) {
+  const lines = [`${label}已提交：operation ${operation.id}（${operation.state || 'queued'}）`];
+  let final = operation;
+  if (args.wait !== false) {
+    const seconds = Math.max(10, Math.min(600, Number(args.timeout_seconds) || 180));
+    final = await api.waitOperation(operation.id, { timeoutMs: seconds * 1000 });
+    lines.push(`结果：${final.state}${final.machineId ? ` · 机器 ${final.machineId}` : ''}`);
+  }
+  lines.push('', '```json', JSON.stringify(final, null, 2), '```');
+  return ok(lines.join('\n'));
+}
+
 function fmtElapsed(seconds) {
   const s = Number(seconds);
   if (!Number.isFinite(s) || s < 0) return '—';
@@ -559,6 +649,8 @@ async function callTool(name, args) {
     case 'instabox_keepalive': return keepaliveTool(args);
     case 'instabox_network_info': return networkTool(args);
     case 'instabox_inspect': return inspectTool(args);
+    case 'instabox_create_machine': return createMachineTool(args);
+    case 'instabox_fork_machine': return forkMachineTool(args);
     case 'instabox_list_accounts': return ok(accountList(store.load()));
     default: return fail(`未知工具：${name}`);
   }

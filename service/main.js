@@ -413,6 +413,49 @@ async function route(req, res, url) {
     return send(res, 200, { ok: true, accounts: data });
   }
 
+  if (method === 'GET' && path === '/api/templates') {
+    const state = store.load();
+    const accounts = selectedAccounts(state, query.account || '');
+    const data = await Promise.all(accounts.map(async (account) => {
+      try {
+        return {
+          alias: account.alias,
+          ok: true,
+          templates: await InstaboxClient.fromAccount(account, state.settings).templates(),
+        };
+      } catch (error) {
+        return { alias: account.alias, ok: false, templates: [], error: { code: error.code, message: error.message } };
+      }
+    }));
+    return send(res, 200, { ok: true, accounts: data });
+  }
+
+  if (method === 'POST' && path === '/api/machines') {
+    const body = await readBody(req);
+    const state = store.load();
+    const account = store.findAccount(state, String(body.account || ''));
+    if (!account) throw new InstaboxError('请先添加一个 Instabox 账号', { code: 'account_not_found', status: 404 });
+    const payload = {};
+    const keys = [
+      'name', 'templateId', 'templateVersion', 'snapshotId', 'vcpus', 'memMiB',
+      'rootDiskGiB', 'persistentDiskGiB', 'desiredState', 'autoSuspendAfterSeconds',
+      'maxRunMinutes',
+    ];
+    for (const key of keys) {
+      if (body[key] !== undefined && body[key] !== null && body[key] !== '') payload[key] = body[key];
+    }
+    const operation = await InstaboxClient.fromAccount(account, state.settings).createMachine(payload);
+    return send(res, 202, { ok: true, operationId: operation.id, operation });
+  }
+
+  if (method === 'GET' && parts[0] === 'api' && parts[1] === 'operations' && parts[2] && parts[3]) {
+    const state = store.load();
+    const alias = decodeURIComponent(parts[2]);
+    const operationId = decodeURIComponent(parts[3]);
+    const operation = await clientFor(state, alias).operation(operationId);
+    return send(res, 200, { ok: true, operation });
+  }
+
   if (parts[0] === 'api' && parts[1] === 'snapshots' && parts[2] && parts[3] && method === 'DELETE') {
     const state = store.load();
     const alias = decodeURIComponent(parts[2]);
@@ -537,6 +580,16 @@ async function route(req, res, url) {
       });
       store.save(state);
       return send(res, 200, { ok: true, keepalive: entry });
+    }
+
+    if (rest.length === 1 && rest[0] === 'fork' && method === 'POST') {
+      const body = await readBody(req);
+      const payload = {};
+      if (body.name !== undefined) payload.name = String(body.name).trim();
+      if (body.vcpus !== undefined && body.vcpus !== '') payload.vcpus = body.vcpus;
+      if (body.memMiB !== undefined && body.memMiB !== '') payload.memMiB = body.memMiB;
+      const operation = await client.forkMachine(machineId, payload);
+      return send(res, 202, { ok: true, operationId: operation.id, operation });
     }
 
     if (rest.length === 1 && rest[0] === 'restore' && method === 'POST') {
