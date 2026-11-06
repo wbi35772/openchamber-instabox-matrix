@@ -1020,3 +1020,31 @@ button:disabled {
   .account-picker select { max-width: 92px; }
   .meta-grid { grid-template-columns: 1fr; }
 }
+
+/* ---------- file manager ---------- */
+.breadcrumb {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.crumb {
+  border: 0;
+  background: transparent;
+  padding: 1px 3px;
+  border-radius: 4px;
+  color: var(--blue);
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+.crumb:hover { color: var(--text); background: var(--panel-3); }
+.crumb-sep { color: var(--dim); font-family: var(--mono); font-size: 10px; }
+.file-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.file-actions { display: flex; align-items: center; gap: 5px; }
+.file-upload-label { position: relative; overflow: hidden; cursor: pointer; }
+.file-upload-label input[type="file"] { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.file-row-actions { white-space: nowrap; }
+.file-row-actions .small-btn { margin-left: 4px; }
+.file-preview { max-height: 420px; }

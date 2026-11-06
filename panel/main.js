@@ -1332,7 +1332,7 @@
 
   function openDetail(machine) {
     clearDetailTimer();
-    openModal({ kind: 'detail', machine: machine, tab: 'overview' });
+    openModal({ kind: 'detail', machine: machine, tab: 'overview', filePath: '/data' });
   }
 
   function loadingRow(label) {
@@ -1343,7 +1343,7 @@
     clearDetailTimer();
     var machine = spec.machine;
     var tab = spec.tab || 'overview';
-    var tabs = [['overview', '概览'], ['metrics', '指标'], ['logs', '日志'], ['history', '历史'], ['processes', '进程']];
+    var tabs = [['overview', '概览'], ['files', '文件'], ['metrics', '指标'], ['logs', '日志'], ['history', '历史'], ['processes', '进程']];
     var body = [
       '<div class="status-line"><span class="grow">' + esc(machine.name || machine.id) + ' · ' + esc(machine.account) + '</span><span class="badge ' + stateTone(machine) + '">' + esc(stateLabel(machine)) + '</span></div>',
       '<div class="detail-tabs">' + tabs.map(function (entry) {
@@ -1524,11 +1524,96 @@
     return parts.join('');
   }
 
+  function joinPath(dir, name) {
+    var base = String(dir || '/').replace(/\/+$/, '');
+    return (base || '') + '/' + String(name || '').replace(/^\/+/, '');
+  }
+
+  function baseName(path) {
+    var clean = String(path || '').replace(/\/+$/, '');
+    var index = clean.lastIndexOf('/');
+    return index >= 0 ? clean.slice(index + 1) : clean;
+  }
+
+  function breadcrumb(path) {
+    var parts = String(path || '/').split('/').filter(Boolean);
+    var crumbs = ['<button class="crumb" data-act="file-open" data-path="/">/</button>'];
+    var accum = '';
+    parts.forEach(function (part) {
+      accum += '/' + part;
+      crumbs.push('<span class="crumb-sep">/</span><button class="crumb" data-act="file-open" data-path="' + esc(accum) + '">' + esc(part) + '</button>');
+    });
+    return crumbs.join('');
+  }
+
+  function filesBody(files) {
+    var path = (files && files.path) || '/';
+    var entries = (files && files.entries) || [];
+    var parts = [];
+    parts.push([
+      '<div class="file-bar">',
+      '<div class="breadcrumb">' + breadcrumb(path) + '</div>',
+      '<div class="file-actions">',
+      '<label class="small-btn file-upload-label">上传<input type="file" id="file-upload-input" data-path="' + esc(path) + '"></label>',
+      '</div>',
+      '</div>',
+    ].join(''));
+    if (!entries.length) {
+      parts.push('<div class="list-row"><span class="grow sub">空目录。</span></div>');
+    } else {
+      parts.push('<div class="table-wrap"><table class="detail-table"><thead><tr><th>名称</th><th>大小</th><th>权限</th><th>修改时间</th><th></th></tr></thead><tbody>');
+      entries.forEach(function (entry) {
+        var entryPath = joinPath(path, entry.name);
+        var isDir = entry.type === 'dir';
+        var label = isDir ? entry.name + '/' : entry.name;
+        if (entry.type === 'symlink' && entry.target) label += ' → ' + entry.target;
+        var actions = isDir
+          ? '<button class="small-btn" data-act="file-open" data-path="' + esc(entryPath) + '">打开</button>'
+          : '<button class="small-btn" data-act="file-preview" data-path="' + esc(entryPath) + '">预览</button>'
+            + '<button class="small-btn" data-act="file-download" data-path="' + esc(entryPath) + '">下载</button>';
+        parts.push([
+          '<tr>',
+          '<td class="mono" title="' + esc(entry.name) + '">' + esc(label) + '</td>',
+          '<td class="num">' + esc(isDir ? '—' : fmtBytes(entry.size)) + '</td>',
+          '<td class="mono">' + esc(entry.mode || '—') + '</td>',
+          '<td class="mono">' + esc(fmtDate(entry.modTime)) + '</td>',
+          '<td class="file-row-actions">' + actions + '</td>',
+          '</tr>',
+        ].join(''));
+      });
+      parts.push('</tbody></table></div>');
+    }
+    parts.push('<div id="file-preview"></div>');
+    parts.push('<div class="divider"></div>');
+    parts.push('<div class="hint">大文件（&gt;4 MiB）上传：生成一次性链接，把 curl 命令放到本机执行。</div>');
+    parts.push('<div class="file-bar"><input class="input grow" id="file-upload-target" value="' + esc(joinPath(path, 'upload.bin')) + '"><button class="small-btn" data-act="file-upload-url">生成上传链接</button></div>');
+    parts.push('<div id="file-upload-result"></div>');
+    return parts.join('');
+  }
+
   async function loadDetailTab(machine, tab) {
     var body = $('#detail-body');
     if (!body) return;
     if (tab === 'overview') {
       body.innerHTML = detailOverview(machine);
+      return;
+    }
+    if (tab === 'files') {
+      var filesPath = (state.modal && state.modal.filePath) || '/data';
+      body.innerHTML = loadingRow('读取目录…');
+      try {
+        var listing = await service('GET', detailBase(machine) + '/files', {
+          query: { path: filesPath },
+          timeoutMs: 45000,
+        });
+        if (!detailOpen(machine, 'files')) return;
+        var files = listing.files || {};
+        if (state.modal) state.modal.filePath = files.path || filesPath;
+        body.innerHTML = filesBody(files);
+      } catch (error) {
+        if (!detailOpen(machine, 'files')) return;
+        body.innerHTML = '<div class="status-line bad">' + esc(describeError(error)) + '</div>';
+      }
       return;
     }
     body.innerHTML = loadingRow(tab === 'metrics' ? '读取指标…' : tab === 'logs' ? '读取日志…' : tab === 'history' ? '读取历史…' : '读取进程…');
@@ -1604,6 +1689,109 @@
       target.dataset.open = '1';
       button.textContent = '收起';
     });
+  }
+
+  async function previewFile(button) {
+    var machine = state.modal && state.modal.machine;
+    var target = $('#file-preview');
+    if (!machine || !target) return;
+    await withButton(button, async function () {
+      var data = await service('GET', detailBase(machine) + '/files', {
+        query: { path: button.dataset.path },
+        timeoutMs: 45000,
+      });
+      var files = data.files || {};
+      if (files.binary) {
+        target.innerHTML = '<div class="status-line">二进制文件（' + esc(fmtBytes(files.size)) + '），请下载。</div>';
+        return;
+      }
+      if (files.type !== 'file') {
+        target.innerHTML = '<div class="status-line">不是普通文件。</div>';
+        return;
+      }
+      target.innerHTML = '<div class="hint">' + esc(files.path) + ' · ' + esc(fmtBytes(files.size)) + (files.truncated ? ' · 预览截断' : '') + '</div>'
+        + '<pre class="code-block file-preview">' + esc(files.content || '(空文件)') + '</pre>';
+    });
+  }
+
+  async function downloadFileAction(button) {
+    var machine = state.modal && state.modal.machine;
+    if (!machine) return;
+    var path = button.dataset.path;
+    await withButton(button, async function () {
+      var data = await service('GET', detailBase(machine) + '/files/download', {
+        query: { path: path },
+        timeoutMs: 60000,
+      });
+      var file = data.file || {};
+      var binary = atob(String(file.base64 || ''));
+      var bytes = new Uint8Array(binary.length);
+      for (var i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+      var blob = new Blob([bytes], { type: 'application/octet-stream' });
+      var url = URL.createObjectURL(blob);
+      var link = document.createElement('a');
+      link.href = url;
+      link.download = baseName(file.path || path);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
+      toast('已开始下载 ' + baseName(file.path || path), 'success');
+    });
+  }
+
+  async function createUploadLink(button) {
+    var machine = state.modal && state.modal.machine;
+    if (!machine) return;
+    await withButton(button, async function () {
+      var input = $('#file-upload-target');
+      var path = input && input.value.trim();
+      if (!path) throw new Error('填写目标路径');
+      var data = await service('POST', detailBase(machine) + '/files/upload-url', {
+        body: { path: path, parents: true },
+        timeoutMs: 30000,
+      });
+      var upload = data.upload || {};
+      var result = $('#file-upload-result');
+      if (!result) return;
+      result.innerHTML = '<div class="hint">有效期至 ' + esc(fmtDate(upload.expiresAt)) + ' · 最大 ' + esc(fmtBytes(upload.maxBytes)) + '</div>'
+        + '<div class="ssh-row"><code title="' + esc(data.curl) + '">' + esc(data.curl) + '</code>'
+        + '<button data-act="copy" data-copy="' + esc(data.curl) + '" title="复制 curl">' + icon('copy') + '</button></div>';
+    });
+  }
+
+  async function handleFileUpload(input) {
+    var machine = state.modal && state.modal.machine;
+    var file = input.files && input.files[0];
+    if (!machine || !file) return;
+    if (file.size > 4 * 1024 * 1024) {
+      toast('文件超过 4 MiB，请用上传链接', 'error');
+      input.value = '';
+      return;
+    }
+    var dir = input.dataset.path || '/';
+    try {
+      var base64 = await new Promise(function (resolve, reject) {
+        var reader = new FileReader();
+        reader.onload = function () {
+          var result = String(reader.result || '');
+          var comma = result.indexOf(',');
+          resolve(comma >= 0 ? result.slice(comma + 1) : result);
+        };
+        reader.onerror = function () { reject(reader.error || new Error('读取文件失败')); };
+        reader.readAsDataURL(file);
+      });
+      await service('POST', detailBase(machine) + '/files/write', {
+        body: { path: joinPath(dir, file.name), base64: base64, parents: false },
+        timeoutMs: 60000,
+      });
+      toast('已上传 ' + file.name, 'success');
+      void loadDetailTab(machine, 'files');
+    } catch (error) {
+      toast(describeError(error), 'error');
+    } finally {
+      input.value = '';
+    }
   }
 
   function field(label, control) {
@@ -2050,6 +2238,15 @@
         return;
       }
       if (act === 'history-entry') { loadHistoryEntry(el); return; }
+      if (act === 'file-open') {
+        if (!state.modal || state.modal.kind !== 'detail') return;
+        state.modal.filePath = el.dataset.path || '/';
+        void loadDetailTab(state.modal.machine, 'files');
+        return;
+      }
+      if (act === 'file-preview') { previewFile(el); return; }
+      if (act === 'file-download') { downloadFileAction(el); return; }
+      if (act === 'file-upload-url') { createUploadLink(el); return; }
       if (act === 'snapshots') { openModal({ kind: 'snapshots', machine: machineFrom(el) }); return; }
       if (act === 'ports') { openModal({ kind: 'ports', machine: machineFrom(el) }); return; }
       if (act === 'attach') {
@@ -2083,6 +2280,7 @@
 
     document.addEventListener('change', function (event) {
       var target = event.target;
+      if (target && target.id === 'file-upload-input') { void handleFileUpload(target); return; }
       if (target && target.id === 'create-account') { loadTemplates(target.value); return; }
       if (target && target.id === 'create-template') { prefillTemplate(target); return; }
       var el = event.target.closest('[data-change]');

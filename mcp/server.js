@@ -259,6 +259,23 @@ const TOOLS = [
     description: 'List configured Instabox account aliases, key fingerprints, organizations and verification status.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
+  {
+    name: 'instabox_files',
+    description: 'Browse, read or write files in an Instabox sandbox. list returns a directory table; read returns text content (binary is rejected); write uploads UTF-8 text content up to 4 MiB.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        operation: { type: 'string', enum: ['list', 'read', 'write'] },
+        machine_id: { type: 'string', description: 'Sandbox ID (m_...) or exact sandbox name.' },
+        path: { type: 'string', description: 'Absolute path, e.g. /data/notes.txt. Defaults to / for list.' },
+        account: { type: 'string', description: 'Account alias; omit for the active account.' },
+        content: { type: 'string', description: 'Text content for write.' },
+        parents: { type: 'boolean', description: 'Create missing parent directories on write.' },
+      },
+      required: ['operation', 'machine_id'],
+      additionalProperties: false,
+    },
+  },
 ];
 
 async function listMachines(args) {
@@ -639,6 +656,65 @@ function fmtElapsed(seconds) {
   return `${Math.floor(s / 86400)}d ${Math.round((s % 86400) / 3600)}h`;
 }
 
+async function filesTool(args) {
+  const state = store.load();
+  const account = resolveAccount(state, args.account);
+  const api = client(account, state);
+  const machineId = String(args.machine_id || '').trim();
+  if (!machineId) return fail('machine_id 不能为空');
+  const operation = String(args.operation || '');
+  const path = String(args.path || (operation === 'list' ? '/' : '')).trim();
+
+  if (operation === 'list') {
+    const files = await api.listFiles(machineId, path || '/');
+    const lines = [`## ${machineId}:${files.path || path || '/'}`, ''];
+    if (files.type !== 'dir') {
+      lines.push(`类型：${files.type} · ${fmtBytes(files.size)} · ${files.mode || '—'} · ${fmtDate(files.modTime)}`);
+      return ok(lines.join('\n'));
+    }
+    const entries = files.entries || [];
+    if (!entries.length) {
+      lines.push('空目录。');
+      return ok(lines.join('\n'));
+    }
+    lines.push('| 名称 | 类型 | 大小 | 权限 | 修改时间 |', '| --- | --- | --- | --- | --- |');
+    for (const entry of entries) {
+      const name = entry.type === 'symlink' && entry.target ? `${entry.name} → ${entry.target}` : entry.name;
+      lines.push(`| ${String(name).replace(/\|/g, '\\|')} | ${entry.type} | ${entry.type === 'dir' ? '—' : fmtBytes(entry.size)} | ${entry.mode || '—'} | ${fmtDate(entry.modTime)} |`);
+    }
+    if (entries.length >= 5000) lines.push('\n条目达到 5000 上限，列表可能被截断。');
+    return ok(lines.join('\n'));
+  }
+
+  if (operation === 'read') {
+    if (!path) return fail('read 需要 path');
+    const files = await api.readFile(machineId, path);
+    if (files.binary) return fail(`${files.path} 是二进制文件（${fmtBytes(files.size)}），请用面板下载。`);
+    if (files.type !== 'file') return fail(`${files.path} 不是普通文件（${files.type}）。`);
+    const lines = [
+      `## ${files.path}`,
+      '',
+      `${fmtBytes(files.size)} · ${files.mode || '—'} · ${fmtDate(files.modTime)}${files.truncated ? ' · 预览截断（前 256 KiB）' : ''}`,
+      '',
+      '```',
+      files.content || '(空文件)',
+      '```',
+    ];
+    return ok(lines.join('\n'));
+  }
+
+  if (operation === 'write') {
+    if (!path) return fail('write 需要 path');
+    if (args.content === undefined) return fail('write 需要 content');
+    const data = Buffer.from(String(args.content), 'utf8');
+    if (data.length > 4 * 1024 * 1024) return fail(`content 超过 4 MiB（${fmtBytes(data.length)}）`);
+    const written = await api.writeFile(machineId, path, data, { parents: args.parents === true });
+    return ok(`已写入 ${written.path}\n\n大小 ${fmtBytes(written.size)} · 权限 ${written.mode || '—'} · sha256 ${written.sha256 || '—'}${written.created ? ' · 新建' : ' · 覆盖'}`);
+  }
+
+  return fail(`未知 operation：${operation}`);
+}
+
 async function callTool(name, args) {
   switch (name) {
     case 'instabox_list_machines': return listMachines(args);
@@ -652,6 +728,7 @@ async function callTool(name, args) {
     case 'instabox_create_machine': return createMachineTool(args);
     case 'instabox_fork_machine': return forkMachineTool(args);
     case 'instabox_list_accounts': return ok(accountList(store.load()));
+    case 'instabox_files': return filesTool(args);
     default: return fail(`未知工具：${name}`);
   }
 }

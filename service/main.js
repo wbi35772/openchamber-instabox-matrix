@@ -12,6 +12,7 @@ const PORT = Number(process.env.OPENCHAMBER_SERVICE_PORT || 0);
 const TOKEN = String(process.env.OPENCHAMBER_SERVICE_TOKEN || '');
 const HOST = '127.0.0.1';
 const BODY_LIMIT = 2 * 1024 * 1024;
+const MAX_UPLOAD_BYTES = 4 * 1024 * 1024;
 
 function log(message) {
   try { process.stderr.write(`[instabox-matrix] ${message}\n`); } catch { /* ignore */ }
@@ -63,13 +64,13 @@ function authorized(req) {
   }
 }
 
-function readBody(req) {
+function readBody(req, limit = BODY_LIMIT) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
     req.on('data', (chunk) => {
       size += chunk.length;
-      if (size > BODY_LIMIT) {
+      if (size > limit) {
         reject(new InstaboxError('请求体过大', { code: 'body_too_large', status: 413 }));
         req.destroy();
         return;
@@ -598,6 +599,54 @@ async function route(req, res, url) {
       if (body.snapshotId) payload.snapshotId = String(body.snapshotId);
       if (body.desiredState) payload.desiredState = body.desiredState === 'stopped' ? 'stopped' : 'running';
       return send(res, 200, { ok: true, operation: await client.power(machineId, 'restore', { body: payload }) });
+    }
+
+    if (rest[0] === 'files' && rest.length === 1 && method === 'GET') {
+      const files = await client.listFiles(machineId, query.path || '/');
+      return send(res, 200, { ok: true, files });
+    }
+
+    if (rest[0] === 'files' && rest.length === 2 && rest[1] === 'download' && method === 'GET') {
+      const data = await client.downloadFile(machineId, query.path || '');
+      return send(res, 200, {
+        ok: true,
+        file: {
+          path: data.path,
+          mode: data.mode,
+          size: data.size,
+          base64: data.buffer.toString('base64'),
+        },
+      });
+    }
+
+    if (rest[0] === 'files' && rest.length === 2 && rest[1] === 'write' && method === 'POST') {
+      const body = await readBody(req, 8 * 1024 * 1024);
+      const base64 = String(body.base64 || '');
+      if (!base64) throw new InstaboxError('缺少 base64 内容', { code: 'missing_content', status: 400 });
+      const buffer = Buffer.from(base64, 'base64');
+      if (buffer.length > MAX_UPLOAD_BYTES) {
+        throw new InstaboxError('上传文件不能超过 4 MiB', { code: 'file_too_large', status: 413 });
+      }
+      const written = await client.writeFile(machineId, body.path, buffer, {
+        mode: body.mode,
+        parents: Boolean(body.parents),
+      });
+      return send(res, 200, { ok: true, written });
+    }
+
+    if (rest[0] === 'files' && rest.length === 2 && rest[1] === 'upload-url' && method === 'POST') {
+      const body = await readBody(req);
+      const upload = await client.createUploadURL(machineId, {
+        path: body.path,
+        expiresInSeconds: body.expiresInSeconds,
+        mode: body.mode,
+        parents: Boolean(body.parents),
+      });
+      return send(res, 200, {
+        ok: true,
+        upload,
+        curl: `curl -T LOCAL_FILE '${upload.url}'`,
+      });
     }
 
     if (rest.length === 1 && method === 'POST') {
