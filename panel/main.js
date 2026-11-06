@@ -676,10 +676,18 @@
     var keepalive = machine.keepalive || null;
     var keepaliveClasses = ['keepalive'];
     if (keepalive) keepaliveClasses.push(keepalive.lastOk === false ? 'error' : 'on');
-    var intervals = [60, 120, 240, 300, 600];
-    var interval = keepalive ? keepalive.intervalSeconds : (state.settings.defaultKeepaliveSeconds || 240);
-    if (intervals.indexOf(interval) < 0) intervals.push(interval);
-    intervals.sort(function (a, b) { return a - b; });
+    var ttls = [300, 900, 1800, 3600];
+    var ttl = keepalive ? (keepalive.ttlSeconds || 900) : (state.settings.defaultTtlSeconds || 900);
+    if (ttls.indexOf(ttl) < 0) { ttls.push(ttl); ttls.sort(function (a, b) { return a - b; }); }
+    var modes = ['lease', 'knock', 'both'];
+    var mode = keepalive && keepalive.mode ? keepalive.mode : 'lease';
+    var kaLabel = '关闭';
+    if (keepalive) {
+      if (keepalive.lastOk === false) kaLabel = '失败';
+      else if (keepalive.expiresAt) kaLabel = '租约至 ' + String(keepalive.expiresAt).slice(11, 16);
+      else if (keepalive.lastOk === true) kaLabel = '已触发';
+      else kaLabel = '待运行';
+    }
 
     return [
       '<article class="card state-' + tone + '" data-machine="' + esc(machine.id) + '" data-account="' + esc(machine.account) + '">',
@@ -707,10 +715,15 @@
       '<div class="keepalive-left">',
       '<span class="led"></span>',
       '<span>Keepalive</span>',
-      '<b>' + (keepalive ? (keepalive.lastOk === false ? '失败' : (keepalive.lastOk === true ? '正常' : '待运行')) : '关闭') + '</b>',
-      '<select data-change="keepalive-interval" data-machine="' + esc(machine.id) + '" data-account="' + esc(machine.account) + '" title="保活间隔">',
-      intervals.map(function (value) {
-        return '<option value="' + value + '"' + (value === interval ? ' selected' : '') + '>' + (value >= 60 ? (value / 60) + ' 分钟' : value + ' 秒') + '</option>';
+      '<b data-expires="' + esc(keepalive && keepalive.expiresAt ? keepalive.expiresAt : '') + '">' + esc(kaLabel) + '</b>',
+      '<select data-change="keepalive-mode" data-machine="' + esc(machine.id) + '" data-account="' + esc(machine.account) + '" title="保活模式">',
+      modes.map(function (value) {
+        return '<option value="' + value + '"' + (value === mode ? ' selected' : '') + '>' + value + '</option>';
+      }).join(''),
+      '</select>',
+      '<select data-change="keepalive-ttl" data-machine="' + esc(machine.id) + '" data-account="' + esc(machine.account) + '" title="租约 TTL">',
+      ttls.map(function (value) {
+        return '<option value="' + value + '"' + (value === ttl ? ' selected' : '') + '>' + Math.round(value / 60) + 'm</option>';
       }).join(''),
       '</select>',
       '</div>',
@@ -859,9 +872,9 @@
       '<div class="form-grid">',
       field('默认网关地址（全局）', '<input class="input mono" id="setting-gateway" placeholder="https://api.instabox.sh" value="' + esc(state.settings.gatewayUrl || '') + '" />'),
       '<div class="hint">所有账号的请求默认走这个地址；单个账号可以覆盖。通过本地反代或 CORS 网关时填这里。</div>',
-      field('默认 Keepalive 间隔（秒）', '<input class="input mono" id="setting-keepalive" type="number" min="30" max="3600" step="30" value="' + esc(state.settings.defaultKeepaliveSeconds || 240) + '" />'),
+      field('默认 Lease TTL（分钟）', '<input class="input mono" id="setting-keepalive-ttl" type="number" min="1" max="60" step="1" value="' + esc(Math.round((state.settings.defaultTtlSeconds || 900) / 60)) + '" />'),
       '<div class="divider"></div>',
-      '<div class="hint"><b>Agent 工具</b><br />MCP 服务注册到 <code>opencode.json</code> 的 <code>mcp.servers.instabox-matrix</code> 后可用：<br /><code>instabox_list_machines</code> · <code>instabox_power_action</code> · <code>instabox_exec_command</code> · <code>instabox_manage_snapshot</code> · <code>instabox_expose_port</code> · <code>instabox_list_accounts</code></div>',
+      '<div class="hint"><b>Agent 工具</b><br />MCP 服务注册到 <code>opencode.json</code> 的 <code>mcp.servers.instabox-matrix</code> 后可用：<br /><code>instabox_list_machines</code> · <code>instabox_power_action</code> · <code>instabox_exec_command</code> · <code>instabox_manage_snapshot</code> · <code>instabox_expose_port</code> · <code>instabox_keepalive</code> · <code>instabox_list_accounts</code></div>',
       '<div class="hint">本机状态文件：<code>~/.openchamber-instabox-matrix/state.json</code>（权限 600，含 API Key，不要提交或分享）。</div>',
       '</div>',
     ].join('');
@@ -1072,30 +1085,41 @@
     });
   }
 
+  function keepaliveBody(row, enabled, machineName) {
+    var modeSelect = row ? row.querySelector('select[data-change="keepalive-mode"]') : null;
+    var ttlSelect = row ? row.querySelector('select[data-change="keepalive-ttl"]') : null;
+    return {
+      enabled: enabled,
+      mode: modeSelect ? modeSelect.value : 'lease',
+      ttlSeconds: ttlSelect ? Number(ttlSelect.value) : undefined,
+      machineName: machineName || '',
+    };
+  }
+
+  function tickKeepalive() {
+    service('POST', '/api/keepalive/tick', { body: {}, timeoutMs: 15000 })
+      .catch(function () {})
+      .then(function () { setTimeout(function () { refresh({ silent: true }); }, 800); });
+  }
+
   async function toggleKeepalive(input) {
     var machineId = input.dataset.machine;
     var alias = input.dataset.account;
     var enabled = input.checked;
     var row = input.closest('.keepalive');
-    var intervalSelect = row ? row.querySelector('select') : null;
-    var interval = intervalSelect ? Number(intervalSelect.value) : (state.settings.defaultKeepaliveSeconds || 240);
+    var body = keepaliveBody(row, enabled, input.dataset.name || '');
     try {
-      await service('PUT', '/api/machines/' + encodeURIComponent(alias) + '/' + encodeURIComponent(machineId) + '/keepalive', {
-        body: {
-          enabled: enabled,
-          intervalSeconds: interval,
-          machineName: input.dataset.name || '',
-        },
-      });
-      toast(enabled ? ('Keepalive 已开启：每 ' + Math.round(interval / 60) + ' 分钟') : 'Keepalive 已关闭', 'success');
-      refresh({ silent: true });
+      await service('PUT', '/api/machines/' + encodeURIComponent(alias) + '/' + encodeURIComponent(machineId) + '/keepalive', { body: body });
+      toast(enabled ? ('Keepalive 已开启（' + body.mode + '，TTL ' + Math.round((body.ttlSeconds || 900) / 60) + 'm）') : 'Keepalive 已关闭', 'success');
+      if (enabled) tickKeepalive();
+      else refresh({ silent: true });
     } catch (error) {
       input.checked = !enabled;
       toast(describeError(error), 'error');
     }
   }
 
-  async function changeKeepaliveInterval(select) {
+  async function updateKeepaliveOption(select) {
     var machineId = select.dataset.machine;
     var alias = select.dataset.account;
     var row = select.closest('.keepalive');
@@ -1104,13 +1128,10 @@
     if (!toggle || !toggle.checked) return;
     try {
       await service('PUT', '/api/machines/' + encodeURIComponent(alias) + '/' + encodeURIComponent(machineId) + '/keepalive', {
-        body: {
-          enabled: true,
-          intervalSeconds: Number(select.value),
-          machineName: toggle.dataset.name || '',
-        },
+        body: keepaliveBody(row, true, toggle.dataset.name || ''),
       });
-      toast('间隔已更新', 'success');
+      toast('保活参数已更新', 'success');
+      tickKeepalive();
     } catch (error) {
       toast(describeError(error), 'error');
     }
@@ -1311,8 +1332,8 @@
   async function saveSettings(button) {
     await withButton(button, async function () {
       var gateway = ($('#setting-gateway') || {}).value || '';
-      var keepalive = Number(($('#setting-keepalive') || {}).value) || 240;
-      var data = await service('PUT', '/api/settings', { body: { gatewayUrl: gateway.trim(), defaultKeepaliveSeconds: keepalive } });
+      var ttlMinutes = Math.max(1, Math.min(60, Number(($('#setting-keepalive-ttl') || {}).value) || 15));
+      var data = await service('PUT', '/api/settings', { body: { gatewayUrl: gateway.trim(), defaultTtlSeconds: ttlMinutes * 60 } });
       state.settings = data.settings || state.settings;
       closeModal();
       toast('设置已保存', 'success');
@@ -1444,7 +1465,8 @@
       var el = event.target.closest('[data-change]');
       if (!el) return;
       if (el.dataset.change === 'keepalive-toggle') toggleKeepalive(el);
-      if (el.dataset.change === 'keepalive-interval') changeKeepaliveInterval(el);
+      if (el.dataset.change === 'keepalive-mode') updateKeepaliveOption(el);
+      if (el.dataset.change === 'keepalive-ttl') updateKeepaliveOption(el);
     });
 
     document.addEventListener('input', function (event) {

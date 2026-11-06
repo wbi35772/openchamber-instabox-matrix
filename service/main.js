@@ -205,6 +205,9 @@ async function route(req, res, url) {
     const body = await readBody(req);
     const state = store.load();
     if (body.gatewayUrl !== undefined) state.settings.gatewayUrl = store.normalizeBaseUrl(body.gatewayUrl);
+    if (body.defaultTtlSeconds !== undefined) {
+      state.settings.defaultTtlSeconds = Math.max(60, Math.min(3600, Number(body.defaultTtlSeconds) || 900));
+    }
     if (body.defaultKeepaliveSeconds !== undefined) {
       state.settings.defaultKeepaliveSeconds = Math.max(30, Math.min(3600, Number(body.defaultKeepaliveSeconds) || 240));
     }
@@ -299,6 +302,15 @@ async function route(req, res, url) {
       return send(res, 200, { ok: true });
     }
     throw new InstaboxError('方法不允许', { code: 'method_not_allowed', status: 405 });
+  }
+
+  if (method === 'GET' && path === '/api/keepalive') {
+    return send(res, 200, { ok: true, keepalive: store.load().keepalive });
+  }
+
+  if (method === 'POST' && path === '/api/keepalive/tick') {
+    const patches = await keepalive.tick();
+    return send(res, 200, { ok: true, patches });
   }
 
   if (method === 'GET' && path === '/api/overview') {
@@ -411,15 +423,20 @@ async function route(req, res, url) {
 
     if (rest[0] === 'keepalive' && method === 'PUT') {
       const body = await readBody(req);
+      const enabled = Boolean(body.enabled);
+      if (!enabled) {
+        await keepalive.release(alias, machineId).catch((error) => log(`lease release failed: ${error.message}`));
+      }
       const entry = store.upsertKeepalive(state, {
         account: alias,
         machineId,
         machineName: body.machineName || '',
-        intervalSeconds: body.intervalSeconds,
-        enabled: Boolean(body.enabled),
+        mode: body.mode,
+        ttlSeconds: body.ttlSeconds,
+        knockUrl: body.knockUrl,
+        enabled,
       });
       store.save(state);
-      if (entry) void keepalive.tick();
       return send(res, 200, { ok: true, keepalive: entry });
     }
 
@@ -455,6 +472,10 @@ async function route(req, res, url) {
 
 const server = http.createServer(async (req, res) => {
   try {
+    const url = new URL(req.url || '/', `http://${HOST}:${PORT}`);
+    if (req.method === 'GET' && url.pathname === '/health') {
+      return send(res, 200, { ok: true });
+    }
     if (!authorized(req)) {
       return send(res, 401, { ok: false, error: { code: 'unauthorized', message: 'Missing or invalid service token' } });
     }
@@ -462,7 +483,6 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(204, { 'cache-control': 'no-store' });
       return res.end();
     }
-    const url = new URL(req.url || '/', `http://${HOST}:${PORT}`);
     await route(req, res, url);
   } catch (error) {
     if (!res.headersSent) failure(res, error);

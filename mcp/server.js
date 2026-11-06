@@ -3,6 +3,7 @@
 const readline = require('node:readline');
 const store = require('../lib/store');
 const { InstaboxClient, InstaboxError } = require('../lib/instabox');
+const { createKeepalive } = require('../lib/keepalive');
 
 const SERVER_NAME = 'instabox-matrix';
 const SERVER_VERSION = '1.0.0';
@@ -158,6 +159,23 @@ const TOOLS = [
     },
   },
   {
+    name: 'instabox_keepalive',
+    description: 'Manage the official Instabox activity lease (prevents idle auto-suspend) or an external port-knock keepalive for a sandbox.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        operation: { type: 'string', enum: ['set', 'clear', 'status'] },
+        machine_id: { type: 'string', description: 'Sandbox ID or name. Required for set/clear.' },
+        account: { type: 'string', description: 'Account alias; omit for the active account.' },
+        mode: { type: 'string', enum: ['lease', 'knock', 'both'], description: 'Keepalive mode; default lease.' },
+        ttl_seconds: { type: 'integer', minimum: 60, maximum: 3600, description: 'Lease TTL in seconds; default 900.' },
+        knock_url: { type: 'string', description: 'Published port URL to poll for knock mode.' },
+      },
+      required: ['operation'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'instabox_list_accounts',
     description: 'List configured Instabox account aliases, key fingerprints, organizations and verification status.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
@@ -187,7 +205,10 @@ async function listMachines(args) {
       }
       const rows = machines.map((m) => {
         const ka = keepalive.get(m.id);
-        return `| ${m.id} | ${m.name || ''} | ${stateLabel(m)} | ${machineSpec(m)} | ${m.template ? `${m.template.id} ${m.template.version}` : '—'} | ${m.autoSuspendAfterSeconds === null ? 'off' : `${m.autoSuspendAfterSeconds}s`} | ${ka ? `${ka.intervalSeconds}s${ka.lastOk === false ? ' ⚠' : ''}` : '—'} |`;
+        const kaText = ka
+          ? `${ka.mode || 'lease'}${ka.expiresAt ? ` → ${new Date(ka.expiresAt).toISOString().slice(11, 16)}Z` : ''}${ka.lastOk === false ? ' ⚠' : ''}`
+          : '—';
+        return `| ${m.id} | ${m.name || ''} | ${stateLabel(m)} | ${machineSpec(m)} | ${m.template ? `${m.template.id} ${m.template.version}` : '—'} | ${m.autoSuspendAfterSeconds === null ? 'off' : `${m.autoSuspendAfterSeconds}s`} | ${kaText} |`;
       });
       blocks.push([
         header,
@@ -315,6 +336,52 @@ async function exposePort(args) {
   return fail(`未知 operation：${operation}`);
 }
 
+async function keepaliveTool(args) {
+  const state = store.load();
+  const operation = String(args.operation || 'status');
+
+  if (operation === 'status') {
+    if (!state.keepalive.length) return ok('没有启用中的 keepalive。');
+    const rows = state.keepalive.map((k) => {
+      const left = k.expiresAt ? Math.max(0, Math.round((new Date(k.expiresAt).getTime() - Date.now()) / 60000)) : null;
+      return `| ${k.account} | ${k.machineId} | ${k.machineName || ''} | ${k.mode || 'lease'} | ${k.ttlSeconds || 900}s | ${left === null ? '待创建' : `${left} 分钟`} | ${k.lastOk === false ? `⚠ ${k.lastError || '失败'}` : 'ok'} |`;
+    });
+    return ok(['| 账号 | 机器 | 名称 | 模式 | TTL | 租约剩余 | 状态 |', '| --- | --- | --- | --- | --- | --- | --- |', ...rows].join('\n'));
+  }
+
+  if (!args.machine_id) return fail('需要 machine_id。');
+  const account = resolveAccount(state, args.account);
+  const keepalive = createKeepalive({});
+
+  if (operation === 'clear') {
+    await keepalive.release(account.alias, args.machine_id).catch(() => {});
+    store.upsertKeepalive(state, { account: account.alias, machineId: args.machine_id, enabled: false });
+    store.save(state);
+    return ok(`已关闭 keepalive：${args.machine_id}`);
+  }
+
+  if (operation === 'set') {
+    store.upsertKeepalive(state, {
+      account: account.alias,
+      machineId: args.machine_id,
+      machineName: args.machine_name || '',
+      mode: args.mode,
+      ttlSeconds: args.ttl_seconds,
+      knockUrl: args.knock_url,
+      enabled: true,
+    });
+    store.save(state);
+    const patches = await keepalive.tick();
+    const patch = patches.find((p) => p.entry.account === account.alias && p.entry.machineId === args.machine_id);
+    const fresh = store.load().keepalive.find((k) => k.account === account.alias && k.machineId === args.machine_id);
+    const stateText = fresh ? `${fresh.mode} · ${fresh.ttlSeconds}s${fresh.expiresAt ? ` · 租约至 ${fresh.expiresAt}` : ''}` : '已写入';
+    const errorText = patch && patch.patch.lastError ? `\n\n⚠ ${patch.patch.lastError}` : '';
+    return ok(`keepalive 已开启：${args.machine_id}\n\n${stateText}${errorText}`);
+  }
+
+  return fail(`未知 operation：${operation}`);
+}
+
 async function callTool(name, args) {
   switch (name) {
     case 'instabox_list_machines': return listMachines(args);
@@ -322,6 +389,7 @@ async function callTool(name, args) {
     case 'instabox_exec_command': return execCommand(args);
     case 'instabox_manage_snapshot': return manageSnapshot(args);
     case 'instabox_expose_port': return exposePort(args);
+    case 'instabox_keepalive': return keepaliveTool(args);
     case 'instabox_list_accounts': return ok(accountList(store.load()));
     default: return fail(`未知工具：${name}`);
   }
