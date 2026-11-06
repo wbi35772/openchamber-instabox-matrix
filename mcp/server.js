@@ -193,6 +193,26 @@ const TOOLS = [
     },
   },
   {
+    name: 'instabox_inspect',
+    description: 'Read a sandbox inspector view: metrics, console logs and operations, exec history (with stdout/stderr), or the process list.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: ['metrics', 'logs', 'history', 'history_entry', 'processes'] },
+        machine_id: { type: 'string', description: 'Sandbox ID or name.' },
+        account: { type: 'string', description: 'Account alias; omit for the active account.' },
+        exec_id: { type: 'string', description: 'Command ID (ex_…) for kind=history_entry.' },
+        since: { type: 'string', description: 'RFC 3339 start time for kind=metrics; default 5 minutes ago.' },
+        tail: { type: 'integer', minimum: 1, maximum: 5000, description: 'Console lines for kind=logs; default 200.' },
+        limit: { type: 'integer', minimum: 1, maximum: 200, description: 'History rows for kind=history; default 50.' },
+        cursor: { type: 'string', description: 'Pagination cursor for kind=history.' },
+        all: { type: 'boolean', description: 'Include kernel threads in kind=processes.' },
+      },
+      required: ['kind', 'machine_id'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'instabox_list_accounts',
     description: 'List configured Instabox account aliases, key fingerprints, organizations and verification status.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
@@ -417,6 +437,118 @@ async function networkTool(args) {
   return ok(lines.join('\n'));
 }
 
+async function inspectTool(args) {
+  const state = store.load();
+  const account = resolveAccount(state, args.account);
+  const machineId = String(args.machine_id || '').trim();
+  if (!machineId) return fail('machine_id 不能为空');
+  const kind = String(args.kind || '').trim();
+  const api = client(account, state);
+  const head = `## ${machineId} — ${kind}`;
+
+  if (kind === 'metrics') {
+    const data = await api.metrics(machineId, { since: args.since });
+    const samples = (data && data.metrics) || [];
+    if (!samples.length) return ok(`${head}\n\n窗口内没有采样：机器没有运行。`);
+    const rows = samples.slice(-24).map((s) => `| ${fmtDate(s.timestamp)} | ${Number(s.cpuUsedPct || 0).toFixed(1)}% | ${fmtBytes(s.memUsed)} / ${fmtBytes(s.memTotal)} | ${fmtBytes(s.netInBytesPerSec)}/s | ${fmtBytes(s.netOutBytesPerSec)}/s |`);
+    const lines = [
+      head,
+      '',
+      '| 时间 | CPU | 内存 | 入站 | 出站 |',
+      '| --- | --- | --- | --- | --- |',
+      ...rows,
+    ];
+    if (samples.length > rows.length) lines.push(`\n仅显示最近 ${rows.length} / ${samples.length} 个采样。`);
+    const disk = data && data.disk;
+    if (disk && Array.isArray(disk.filesystems)) {
+      lines.push('', '| 挂载 | 已用 | 可用 | 使用率 |', '| --- | --- | --- | --- |');
+      for (const fs of disk.filesystems) {
+        lines.push(`| ${fs.mount} | ${fmtBytes(fs.usedBytes)} | ${fmtBytes(fs.availableBytes)} | ${Number(fs.usedPct || 0).toFixed(1)}% |`);
+      }
+    }
+    return ok(lines.join('\n'));
+  }
+
+  if (kind === 'logs') {
+    const tail = Math.max(1, Math.min(5000, Number(args.tail) || 200));
+    const data = await api.logs(machineId, { tail });
+    const lines = [head, ''];
+    if (data.consoleUnavailable) lines.push(`⚠ 控制台不可读：${data.consoleUnavailable}`);
+    else lines.push('```', data.console || '(无输出)', '```');
+    const operations = (data.operations || []).slice().reverse();
+    lines.push('', `最近操作 ${operations.length} 个`);
+    for (const op of operations) {
+      const detail = op.error ? (op.error.message || op.error.code || '') : (op.phase || '');
+      lines.push(`- ${fmtDate(op.updatedAt || op.createdAt)} · ${op.type} · ${op.state}${detail ? ` · ${detail}` : ''}`);
+    }
+    return ok(lines.join('\n'));
+  }
+
+  if (kind === 'history') {
+    const limit = Math.max(1, Math.min(200, Number(args.limit) || 50));
+    const data = await api.history(machineId, { limit, cursor: args.cursor || undefined });
+    const commands = (data && data.commands) || [];
+    if (!commands.length) return ok(`${head}\n\n没有命令历史。`);
+    const lines = [
+      head,
+      '',
+      '| ID | 时间 | 状态 | 退出码 | 耗时 | 命令 |',
+      '| --- | --- | --- | --- | --- | --- |',
+    ];
+    for (const entry of commands) {
+      const command = String(entry.command || '').replace(/\|/g, '\\|').replace(/\n/g, ' ');
+      lines.push(`| ${entry.id} | ${fmtDate(entry.startedAt)} | ${entry.status} | ${entry.exitCode} | ${Number(entry.durationMs || 0)}ms | ${command} |`);
+    }
+    if (data.nextCursor) lines.push(`\n更多：cursor=${data.nextCursor}`);
+    return ok(lines.join('\n'));
+  }
+
+  if (kind === 'history_entry') {
+    const execId = String(args.exec_id || '').trim();
+    if (!execId) return fail('kind=history_entry 需要 exec_id');
+    const entry = await api.historyEntry(machineId, execId);
+    const lines = [
+      head,
+      '',
+      `命令：${entry.command}`,
+      `状态：${entry.status} · 退出码 ${entry.exitCode} · ${Number(entry.durationMs || 0)}ms`,
+      `时间：${fmtDate(entry.startedAt)} → ${fmtDate(entry.endedAt)}`,
+    ];
+    if (entry.outputTruncated) lines.push('输出已截断（每个流保留前 64 KiB）。');
+    lines.push('', '**stdout**', '```', entry.stdout || '(无)', '```');
+    if (entry.stderr) lines.push('', '**stderr**', '```', entry.stderr, '```');
+    return ok(lines.join('\n'));
+  }
+
+  if (kind === 'processes') {
+    const data = await api.processes(machineId, { all: Boolean(args.all) });
+    const processes = (data && data.processes) || [];
+    const lines = [
+      head,
+      '',
+      `${data.live ? '实时读取' : '上次保存的快照'} · ${fmtDate(data.capturedAt)} · ${processes.length} 个进程${data.truncated ? ' · 列表被截断' : ''}`,
+    ];
+    if (!processes.length) return ok(`${head}\n\n没有进程数据。`);
+    lines.push('', '| PID | 用户 | CPU | 内存 | 时长 | 命令 |', '| --- | --- | --- | --- | --- | --- |');
+    for (const proc of processes) {
+      const command = String(proc.command || '').replace(/\|/g, '\\|');
+      lines.push(`| ${proc.pid} | ${proc.user} | ${Number(proc.cpuPercent || 0).toFixed(1)}% | ${Number(proc.memPercent || 0).toFixed(1)}% | ${fmtElapsed(proc.elapsedSeconds)} | ${command} |`);
+    }
+    return ok(lines.join('\n'));
+  }
+
+  return fail(`未知 kind：${kind}`);
+}
+
+function fmtElapsed(seconds) {
+  const s = Number(seconds);
+  if (!Number.isFinite(s) || s < 0) return '—';
+  if (s < 60) return `${Math.round(s)}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ${Math.round((s % 3600) / 60)}m`;
+  return `${Math.floor(s / 86400)}d ${Math.round((s % 86400) / 3600)}h`;
+}
+
 async function callTool(name, args) {
   switch (name) {
     case 'instabox_list_machines': return listMachines(args);
@@ -426,6 +558,7 @@ async function callTool(name, args) {
     case 'instabox_expose_port': return exposePort(args);
     case 'instabox_keepalive': return keepaliveTool(args);
     case 'instabox_network_info': return networkTool(args);
+    case 'instabox_inspect': return inspectTool(args);
     case 'instabox_list_accounts': return ok(accountList(store.load()));
     default: return fail(`未知工具：${name}`);
   }

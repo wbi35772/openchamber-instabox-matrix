@@ -221,6 +221,26 @@
     return (m / 60).toFixed(m % 60 === 0 ? 0 : 1) + ' 小时';
   }
 
+  function fmtDate(iso) {
+    if (!iso) return '—';
+    var date = new Date(iso);
+    if (!Number.isFinite(date.getTime())) return String(iso);
+    return date.toISOString().replace('T', ' ').replace(/\.\d+Z$/, 'Z');
+  }
+
+  function fmtRate(bytes) {
+    return fmtBytes(Number(bytes || 0)) + '/s';
+  }
+
+  function fmtElapsed(seconds) {
+    var s = Number(seconds);
+    if (!Number.isFinite(s) || s < 0) return '—';
+    if (s < 60) return Math.round(s) + 's';
+    if (s < 3600) return Math.floor(s / 60) + 'm ' + Math.round(s % 60) + 's';
+    if (s < 86400) return Math.floor(s / 3600) + 'h ' + Math.round((s % 3600) / 60) + 'm';
+    return Math.floor(s / 86400) + 'd ' + Math.round((s % 86400) / 3600) + 'h';
+  }
+
   function relTime(iso) {
     if (!iso) return '—';
     var then = new Date(iso).getTime();
@@ -804,6 +824,7 @@
   function actionsFor(machine, busy) {
     var actions = [];
     var attrs = ' data-machine="' + esc(machine.id) + '" data-account="' + esc(machine.account) + '"';
+    actions.push('<button class="action-btn" data-act="inspect"' + attrs + '>' + icon('info') + '详情</button>');
     if (machine.state === 'running') {
       actions.push('<button class="action-btn primary" data-act="exec"' + attrs + '>' + icon('terminal') + '执行</button>');
       actions.push('<button class="action-btn" data-act="snapshots"' + attrs + '>' + icon('camera') + '快照</button>');
@@ -838,6 +859,7 @@
   }
 
   function closeModal() {
+    clearDetailTimer();
     state.modal = null;
     state.modalBusy = false;
     var root = $('#modal-root');
@@ -870,6 +892,7 @@
     if (spec.kind === 'snapshots') return renderSnapshotsModal(root, spec);
     if (spec.kind === 'ports') return renderPortsModal(root, spec);
     if (spec.kind === 'delete') return renderDeleteModal(root, spec);
+    if (spec.kind === 'detail') return renderDetailModal(root, spec);
     root.innerHTML = '';
   }
 
@@ -1087,6 +1110,298 @@
       var input = $('#delete-confirm');
       if (input) input.focus();
     }, 30);
+  }
+
+  var detailTimer = null;
+
+  function clearDetailTimer() {
+    if (detailTimer) { clearInterval(detailTimer); detailTimer = null; }
+  }
+
+  function detailOpen(machine, tab) {
+    return Boolean(state.modal && state.modal.kind === 'detail'
+      && state.modal.machine && state.modal.machine.id === machine.id
+      && (!tab || state.modal.tab === tab));
+  }
+
+  function detailBase(machine) {
+    return '/api/machines/' + encodeURIComponent(machine.account) + '/' + encodeURIComponent(machine.id);
+  }
+
+  function openDetail(machine) {
+    clearDetailTimer();
+    openModal({ kind: 'detail', machine: machine, tab: 'overview' });
+  }
+
+  function loadingRow(label) {
+    return '<div class="list-row"><span class="spinner"></span><span class="grow sub">' + esc(label || '读取中…') + '</span></div>';
+  }
+
+  function renderDetailModal(root, spec) {
+    clearDetailTimer();
+    var machine = spec.machine;
+    var tab = spec.tab || 'overview';
+    var tabs = [['overview', '概览'], ['metrics', '指标'], ['logs', '日志'], ['history', '历史'], ['processes', '进程']];
+    var body = [
+      '<div class="status-line"><span class="grow">' + esc(machine.name || machine.id) + ' · ' + esc(machine.account) + '</span><span class="badge ' + stateTone(machine) + '">' + esc(stateLabel(machine)) + '</span></div>',
+      '<div class="detail-tabs">' + tabs.map(function (entry) {
+        return '<button class="detail-tab' + (entry[0] === tab ? ' active' : '') + '" data-act="detail-tab" data-tab="' + entry[0] + '">' + entry[1] + '</button>';
+      }).join('') + '</div>',
+      '<div id="detail-body">' + loadingRow() + '</div>',
+    ].join('');
+    root.innerHTML = modalShell('机器详情 · ' + (machine.name || machine.id), 'info', body, [
+      '<button class="ghost-btn" data-act="refresh-detail">' + icon('refresh') + '刷新</button>',
+      '<button class="ghost-btn" data-act="close-modal">关闭</button>',
+    ].join(''), true);
+    void loadDetailTab(machine, tab);
+  }
+
+  function detailOverview(machine) {
+    var rows = [
+      metaItem('状态', stateLabel(machine)),
+      metaItem('账号', machine.account),
+      metaItem('规格', specText(machine)),
+      metaItem('模板', machine.template ? machine.template.id + ' ' + (machine.template.version || '') : '—'),
+      metaItem('数据盘', diskText(machine)),
+      metaItem('空闲暂停', fmtDuration(machine.autoSuspendAfterSeconds)),
+      metaItem('最长运行', fmtMinutes(machine.maxRunMinutes)),
+      metaItem('创建时间', fmtDate(machine.createdAt)),
+    ];
+    var connection = machine.connection;
+    var ssh = '';
+    if (connection && connection.host) {
+      var command = 'ssh -p ' + connection.port + ' ' + connection.username + '@' + connection.host;
+      ssh = [
+        '<div class="ssh-row">',
+        '<span class="label">SSH</span>',
+        '<code title="' + esc(command) + '">' + esc(connection.username + '@' + connection.host + ':' + connection.port) + '</code>',
+        '<button data-act="copy" data-copy="' + esc(command) + '" title="复制 SSH 命令">' + icon('copy') + '</button>',
+        '</div>',
+      ].join('');
+    }
+    return [
+      '<div class="meta-grid">' + rows.join('') + '</div>',
+      ssh,
+      '<div class="divider"></div>',
+      '<div class="hint">机器 ID <code>' + esc(machine.id) + '</code></div>',
+      '<div class="hint">指标、日志、历史与进程都来自 Instabox API；机器停止时日志和历史仍可读。</div>',
+    ].join('');
+  }
+
+  function sparkline(values, max) {
+    var list = (values || []).map(function (value) { return Number(value) || 0; });
+    if (!list.length) return '<div class="spark-empty">无采样</div>';
+    var top = max;
+    if (!top || !Number.isFinite(top)) {
+      top = Math.max.apply(null, list);
+      if (top <= 0) top = 1;
+    }
+    var width = 100;
+    var height = 28;
+    var step = list.length > 1 ? width / (list.length - 1) : width;
+    var points = list.map(function (value, index) {
+      var x = index * step;
+      var y = height - 1 - (Math.max(0, Math.min(value, top)) / top) * (height - 2);
+      return x.toFixed(1) + ',' + y.toFixed(1);
+    }).join(' ');
+    return '<svg class="spark" viewBox="0 0 ' + width + ' ' + height + '" preserveAspectRatio="none" aria-hidden="true"><polyline points="' + points + '"></polyline></svg>';
+  }
+
+  function metricCard(label, value, chart, foot) {
+    return [
+      '<div class="metric-card">',
+      '<div class="metric-label">' + esc(label) + '</div>',
+      '<div class="metric-value" title="' + esc(value) + '">' + esc(value) + '</div>',
+      chart,
+      '<div class="metric-foot">' + esc(foot) + '</div>',
+      '</div>',
+    ].join('');
+  }
+
+  function metricsBody(data) {
+    var metrics = (data && data.metrics) || [];
+    if (!metrics.length) return '<div class="status-line">窗口内没有采样：机器没有运行。</div>';
+    var last = metrics[metrics.length - 1];
+    var cpuValues = metrics.map(function (m) { return Number(m.cpuUsedPct) || 0; });
+    var memValues = metrics.map(function (m) {
+      return m.memTotal ? (Number(m.memUsed) || 0) / m.memTotal * 100 : 0;
+    });
+    var netValues = metrics.map(function (m) {
+      return (Number(m.netInBytesPerSec) || 0) + (Number(m.netOutBytesPerSec) || 0);
+    });
+    var memPct = last.memTotal ? (Number(last.memUsed) || 0) / last.memTotal * 100 : 0;
+    var parts = [
+      '<div class="metric-grid">',
+      metricCard('CPU', (Number(last.cpuUsedPct) || 0).toFixed(1) + '%', sparkline(cpuValues, 100), (last.cpuCount || '?') + ' vCPU · ' + metrics.length + ' 个采样'),
+      metricCard('内存', fmtBytes(last.memUsed) + ' / ' + fmtBytes(last.memTotal), sparkline(memValues, 100), memPct.toFixed(1) + '%'),
+      metricCard('网络', fmtRate(last.netInBytesPerSec) + ' ↓ · ' + fmtRate(last.netOutBytesPerSec) + ' ↑', sparkline(netValues, null), '入站 / 出站 · 90s 平均'),
+      '</div>',
+    ];
+    var disk = data.disk;
+    if (disk && Array.isArray(disk.filesystems)) {
+      parts.push('<div class="divider"></div>');
+      parts.push('<div class="hint">磁盘（' + esc(fmtDate(disk.measuredAt)) + '）</div>');
+      parts.push('<div class="table-wrap"><table class="detail-table"><thead><tr><th>挂载</th><th>已用</th><th>可用</th><th>使用率</th><th>inode</th></tr></thead><tbody>');
+      disk.filesystems.forEach(function (fs) {
+        parts.push('<tr><td class="mono">' + esc(fs.mount) + '</td><td class="num">' + esc(fmtBytes(fs.usedBytes)) + '</td><td class="num">' + esc(fmtBytes(fs.availableBytes)) + '</td><td class="num">' + esc(Number(fs.usedPct || 0).toFixed(1)) + '%</td><td class="num">' + esc(Number(fs.inodesUsedPct || 0).toFixed(1)) + '%</td></tr>');
+      });
+      parts.push('</tbody></table></div>');
+      if (disk.warning) parts.push('<div class="status-line bad">' + esc(disk.warning.message || ('磁盘接近满：' + disk.warning.mount)) + '</div>');
+    }
+    return parts.join('');
+  }
+
+  function logsBody(data) {
+    var parts = [];
+    if (data.consoleUnavailable) {
+      parts.push('<div class="status-line bad">控制台不可读：' + esc(data.consoleUnavailable) + '</div>');
+    } else {
+      parts.push('<div class="hint">串口控制台（状态：' + esc(data.state || '—') + '）</div>');
+      parts.push('<pre class="code-block">' + esc(data.console || '(无输出)') + '</pre>');
+    }
+    var operations = (data.operations || []).slice().reverse();
+    parts.push('<div class="divider"></div>');
+    parts.push('<div class="hint">最近操作 ' + operations.length + ' 个</div>');
+    if (operations.length) {
+      parts.push('<div class="table-wrap"><table class="detail-table"><thead><tr><th>时间</th><th>类型</th><th>状态</th><th>阶段 / 错误</th></tr></thead><tbody>');
+      operations.forEach(function (op) {
+        var detail = op.error ? (op.error.message || op.error.code || '') : (op.phase || '');
+        parts.push('<tr><td class="mono">' + esc(fmtDate(op.updatedAt || op.createdAt)) + '</td><td>' + esc(op.type) + '</td><td><span class="tag ' + (op.state === 'failed' ? 'bad' : (op.state === 'succeeded' ? 'ok' : '')) + '">' + esc(op.state) + '</span></td><td class="mono">' + esc(detail) + '</td></tr>');
+      });
+      parts.push('</tbody></table></div>');
+    } else {
+      parts.push('<div class="list-row"><span class="grow sub">没有操作记录。</span></div>');
+    }
+    return parts.join('');
+  }
+
+  function historyBody(data, machine) {
+    var commands = (data && data.commands) || [];
+    if (!commands.length) return '<div class="status-line">没有命令历史。</div>';
+    return commands.map(function (entry) {
+      var ok = entry.status === 'exited' && entry.exitCode === 0;
+      var seconds = (Number(entry.durationMs) || 0) / 1000;
+      return [
+        '<div class="history-item">',
+        '<div class="list-row">',
+        '<span class="grow">',
+        '<div class="mono" title="' + esc(entry.command) + '">' + esc(entry.command) + '</div>',
+        '<div class="sub">' + esc(fmtDate(entry.startedAt)) + ' · ' + esc(seconds.toFixed(2)) + 's · exit ' + esc(entry.exitCode) + (entry.outputTruncated ? ' · 输出截断' : '') + '</div>',
+        '</span>',
+        '<span class="tag ' + (ok ? 'ok' : 'bad') + '">' + esc(entry.status) + '</span>',
+        '<button class="small-btn" data-act="history-entry" data-exec="' + esc(entry.id) + '" data-machine="' + esc(machine.id) + '" data-account="' + esc(machine.account) + '">输出</button>',
+        '</div>',
+        '<div class="history-entry"></div>',
+        '</div>',
+      ].join('');
+    }).join('');
+  }
+
+  function processesBody(data) {
+    var processes = (data && data.processes) || [];
+    var parts = [];
+    parts.push('<div class="hint">' + (data.live ? '实时读取' : '上次保存的快照') + ' · ' + esc(fmtDate(data.capturedAt)) + ' · ' + processes.length + ' 个进程' + (data.truncated ? ' · 列表被截断' : '') + '</div>');
+    if (!processes.length) {
+      parts.push('<div class="list-row"><span class="grow sub">没有进程数据。</span></div>');
+      return parts.join('');
+    }
+    parts.push('<div class="table-wrap"><table class="detail-table"><thead><tr><th>PID</th><th>用户</th><th>CPU</th><th>内存</th><th>时长</th><th>命令</th></tr></thead><tbody>');
+    processes.forEach(function (proc) {
+      parts.push([
+        '<tr>',
+        '<td class="num">' + esc(proc.pid) + '</td>',
+        '<td>' + esc(proc.user) + '</td>',
+        '<td class="num">' + esc(Number(proc.cpuPercent || 0).toFixed(1)) + '%</td>',
+        '<td class="num">' + esc(Number(proc.memPercent || 0).toFixed(1)) + '%</td>',
+        '<td class="num">' + esc(fmtElapsed(proc.elapsedSeconds)) + '</td>',
+        '<td class="mono" title="' + esc(proc.command) + '">' + esc(proc.command) + '</td>',
+        '</tr>',
+      ].join(''));
+    });
+    parts.push('</tbody></table></div>');
+    return parts.join('');
+  }
+
+  async function loadDetailTab(machine, tab) {
+    var body = $('#detail-body');
+    if (!body) return;
+    if (tab === 'overview') {
+      body.innerHTML = detailOverview(machine);
+      return;
+    }
+    body.innerHTML = loadingRow(tab === 'metrics' ? '读取指标…' : tab === 'logs' ? '读取日志…' : tab === 'history' ? '读取历史…' : '读取进程…');
+    try {
+      var data;
+      if (tab === 'metrics') {
+        data = await service('GET', detailBase(machine) + '/metrics', {
+          query: { since: new Date(Date.now() - 3600000).toISOString() },
+          timeoutMs: 45000,
+        });
+        if (!detailOpen(machine, 'metrics')) return;
+        body.innerHTML = '<div id="detail-metrics">' + metricsBody(data.data || {}) + '</div><div class="hint">每 30 秒自动刷新。</div>';
+        scheduleMetricsPoll(machine);
+        return;
+      }
+      if (tab === 'logs') {
+        data = await service('GET', detailBase(machine) + '/logs', { query: { tail: 400 }, timeoutMs: 45000 });
+        if (!detailOpen(machine, 'logs')) return;
+        body.innerHTML = logsBody(data.data || {});
+        return;
+      }
+      if (tab === 'history') {
+        data = await service('GET', detailBase(machine) + '/history', { query: { limit: 50 }, timeoutMs: 45000 });
+        if (!detailOpen(machine, 'history')) return;
+        body.innerHTML = historyBody(data.data || {}, machine);
+        return;
+      }
+      if (tab === 'processes') {
+        data = await service('GET', detailBase(machine) + '/processes', { timeoutMs: 60000 });
+        if (!detailOpen(machine, 'processes')) return;
+        body.innerHTML = processesBody(data.data || {});
+      }
+    } catch (error) {
+      if (!detailOpen(machine, tab)) return;
+      body.innerHTML = '<div class="status-line bad">' + esc(describeError(error)) + '</div>';
+    }
+  }
+
+  function scheduleMetricsPoll(machine) {
+    clearDetailTimer();
+    detailTimer = setInterval(function () {
+      if (!detailOpen(machine, 'metrics')) { clearDetailTimer(); return; }
+      var panel = $('#detail-metrics');
+      if (!panel) return;
+      service('GET', detailBase(machine) + '/metrics', {
+        query: { since: new Date(Date.now() - 3600000).toISOString() },
+        timeoutMs: 45000,
+      }).then(function (data) {
+        var current = $('#detail-metrics');
+        if (current && detailOpen(machine, 'metrics')) current.innerHTML = metricsBody(data.data || {});
+      }).catch(function () { /* keep the last chart */ });
+    }, 30000);
+  }
+
+  async function loadHistoryEntry(button) {
+    var item = button.closest('.history-item');
+    if (!item) return;
+    var target = item.querySelector('.history-entry');
+    if (!target) return;
+    if (target.dataset.open === '1') {
+      target.dataset.open = '';
+      target.innerHTML = '';
+      button.textContent = '输出';
+      return;
+    }
+    await withButton(button, async function () {
+      var data = await service('GET', detailBase({ account: button.dataset.account, id: button.dataset.machine }) + '/history/' + encodeURIComponent(button.dataset.exec), { timeoutMs: 45000 });
+      var entry = data.data || {};
+      var parts = ['<pre class="code-block">' + esc(entry.stdout || '(无 stdout)') + '</pre>'];
+      if (entry.stderr) parts.push('<pre class="code-block stderr">' + esc(entry.stderr) + '</pre>');
+      if (entry.outputTruncated) parts.push('<div class="hint">输出已截断（每个流保留前 64 KiB）。</div>');
+      target.innerHTML = parts.join('');
+      target.dataset.open = '1';
+      button.textContent = '收起';
+    });
   }
 
   function field(label, control) {
@@ -1510,6 +1825,21 @@
         return;
       }
       if (act === 'exec') { openModal({ kind: 'exec', machine: machineFrom(el) }); return; }
+      if (act === 'inspect') { openDetail(machineFrom(el)); return; }
+      if (act === 'detail-tab') {
+        if (!state.modal || state.modal.kind !== 'detail') return;
+        state.modal.tab = el.dataset.tab || 'overview';
+        clearDetailTimer();
+        renderModal();
+        return;
+      }
+      if (act === 'refresh-detail') {
+        if (!state.modal || state.modal.kind !== 'detail') return;
+        clearDetailTimer();
+        void loadDetailTab(state.modal.machine, state.modal.tab || 'overview');
+        return;
+      }
+      if (act === 'history-entry') { loadHistoryEntry(el); return; }
       if (act === 'snapshots') { openModal({ kind: 'snapshots', machine: machineFrom(el) }); return; }
       if (act === 'ports') { openModal({ kind: 'ports', machine: machineFrom(el) }); return; }
       if (act === 'attach') {

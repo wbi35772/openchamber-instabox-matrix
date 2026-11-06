@@ -445,6 +445,34 @@ async function route(req, res, url) {
       return send(res, 200, { ok: true, usage: await client.machineUsage(machineId) });
     }
 
+    if (rest[0] === 'metrics' && method === 'GET') {
+      return send(res, 200, { ok: true, data: await client.metrics(machineId, { since: query.since || undefined }) });
+    }
+
+    if (rest[0] === 'logs' && method === 'GET') {
+      const tail = Math.max(1, Math.min(5000, Number(query.tail) || 200));
+      const after = query.after === undefined || query.after === '' ? undefined : Number(query.after);
+      return send(res, 200, { ok: true, data: await client.logs(machineId, { tail, after }) });
+    }
+
+    if (rest[0] === 'history' && method === 'GET') {
+      if (rest.length === 2) {
+        return send(res, 200, { ok: true, data: await client.historyEntry(machineId, rest[1]) });
+      }
+      const limit = Math.max(1, Math.min(200, Number(query.limit) || 50));
+      return send(res, 200, {
+        ok: true,
+        data: await client.history(machineId, { limit, cursor: query.cursor || undefined }),
+      });
+    }
+
+    if (rest[0] === 'processes' && method === 'GET') {
+      return send(res, 200, {
+        ok: true,
+        data: await client.processes(machineId, { all: query.all === 'true' || query.all === '1' }),
+      });
+    }
+
     if (rest[0] === 'exec' && method === 'POST') {
       const body = await readBody(req);
       const cmd = String(body.cmd || '').trim();
