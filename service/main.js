@@ -7,6 +7,7 @@ const { InstaboxClient, InstaboxError } = require('../lib/instabox');
 const { createKeepalive } = require('../lib/keepalive');
 const { createJobs } = require('../lib/jobs');
 const { createNetProbe } = require('../lib/netprobe');
+const { createTerminalManager } = require('../lib/terminal');
 
 const PORT = Number(process.env.OPENCHAMBER_SERVICE_PORT || 0);
 const TOKEN = String(process.env.OPENCHAMBER_SERVICE_TOKEN || '');
@@ -26,6 +27,7 @@ if (!PORT || !TOKEN) {
 const keepalive = createKeepalive({ log });
 const jobs = createJobs();
 const netprobe = createNetProbe();
+const terminals = createTerminalManager({ log });
 const portCache = new Map();
 
 function send(res, status, payload, extraHeaders = {}) {
@@ -40,13 +42,15 @@ function send(res, status, payload, extraHeaders = {}) {
 
 function failure(res, error) {
   const isKnown = error instanceof InstaboxError;
-  const status = isKnown && error.status >= 400 && error.status < 600 ? error.status : 502;
+  const hasStatus = Boolean(error && Number.isInteger(error.status) && error.status >= 400 && error.status < 600);
+  const known = isKnown || hasStatus;
+  const status = known ? error.status : 502;
   send(res, status, {
     ok: false,
     error: {
-      code: isKnown ? error.code : 'internal_error',
+      code: known ? (error.code || 'error') : 'internal_error',
       message: error && error.message ? error.message : String(error),
-      status: isKnown ? error.status : 0,
+      status: known ? error.status : 0,
       retryable: Boolean(isKnown && error.retryable),
       retryAfterSeconds: isKnown ? error.retryAfterSeconds : undefined,
     },
@@ -217,6 +221,35 @@ async function route(req, res, url) {
       accounts: state.accounts.map(store.publicAccount),
       keepalive: state.keepalive,
     });
+  }
+
+  if (parts[0] === 'api' && parts[1] === 'terminal' && parts[2]) {
+    const sessionId = decodeURIComponent(parts[2]);
+    if (method === 'GET' && parts.length === 3) {
+      const session = terminals.get(sessionId);
+      return send(res, 200, { ok: true, terminal: session.poll(query.cursor) });
+    }
+    if (method === 'POST' && parts[3] === 'input' && parts.length === 4) {
+      const body = await readBody(req);
+      const session = terminals.get(sessionId);
+      const bytes = body.dataB64
+        ? Buffer.from(String(body.dataB64), 'base64')
+        : Buffer.from(String(body.data === undefined ? '' : body.data), 'utf8');
+      session.send(bytes);
+      return send(res, 200, { ok: true });
+    }
+    if (method === 'POST' && parts[3] === 'resize' && parts.length === 4) {
+      const body = await readBody(req);
+      const session = terminals.get(sessionId);
+      session.resize(body.cols, body.rows);
+      return send(res, 200, { ok: true });
+    }
+    if (method === 'DELETE' && parts.length === 3) {
+      const session = terminals.get(sessionId);
+      session.close('client');
+      return send(res, 200, { ok: true });
+    }
+    throw new InstaboxError('接口不存在', { code: 'not_found', status: 404 });
   }
 
   if (method === 'GET' && path === '/api/settings') {
@@ -464,6 +497,20 @@ async function route(req, res, url) {
     const client = clientFor(state, alias);
     await client.deleteSnapshot(snapshotId, snapshotId);
     return send(res, 200, { ok: true });
+  }
+
+  if (parts[0] === 'api' && parts[1] === 'machines' && parts[2] && parts[3] && parts[4] === 'terminal' && parts.length === 5 && method === 'POST') {
+    const state = store.load();
+    const alias = decodeURIComponent(parts[2]);
+    const machineId = decodeURIComponent(parts[3]);
+    const client = clientFor(state, alias);
+    const session = await terminals.create({ baseUrl: client.baseUrl, apiKey: client.apiKey, machineId });
+    return send(res, 201, {
+      ok: true,
+      sessionId: session.id,
+      session: session.serverSession,
+      persistent: session.persistent,
+    });
   }
 
   if (parts[0] === 'api' && parts[1] === 'machines' && parts[2] && parts[3]) {
@@ -754,6 +801,7 @@ function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
   keepalive.stop();
+  terminals.closeAll();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 2000).unref();
 }

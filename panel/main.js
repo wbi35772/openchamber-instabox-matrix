@@ -856,12 +856,14 @@
   /* ------------------------------------------------------------------ */
 
   function openModal(spec) {
+    if (state.modal && state.modal.terminal) stopTerminal();
     state.modal = spec;
     renderModal();
   }
 
   function closeModal() {
     clearDetailTimer();
+    stopTerminal();
     state.modal = null;
     state.modalBusy = false;
     var root = $('#modal-root');
@@ -1341,9 +1343,10 @@
 
   function renderDetailModal(root, spec) {
     clearDetailTimer();
+    stopTerminal();
     var machine = spec.machine;
     var tab = spec.tab || 'overview';
-    var tabs = [['overview', '概览'], ['access', '访问'], ['files', '文件'], ['metrics', '指标'], ['logs', '日志'], ['history', '历史'], ['processes', '进程']];
+    var tabs = [['overview', '概览'], ['terminal', '终端'], ['access', '访问'], ['files', '文件'], ['metrics', '指标'], ['logs', '日志'], ['history', '历史'], ['processes', '进程']];
     var body = [
       '<div class="status-line"><span class="grow">' + esc(machine.name || machine.id) + ' · ' + esc(machine.account) + '</span><span class="badge ' + stateTone(machine) + '">' + esc(stateLabel(machine)) + '</span></div>',
       '<div class="detail-tabs">' + tabs.map(function (entry) {
@@ -1753,11 +1756,210 @@
     detailTimer = setInterval(tick, 30000);
   }
 
+  function b64ToBytes(value) {
+    var binary = atob(String(value || ''));
+    var bytes = new Uint8Array(binary.length);
+    for (var i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
+  function bytesToB64(text) {
+    var bytes = new TextEncoder().encode(String(text));
+    var binary = '';
+    for (var i = 0; i < bytes.length; i += 0x8000) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    return btoa(binary);
+  }
+
+  function terminalBody() {
+    return [
+      '<div class="terminal-head">',
+      '<span class="tag ok" id="terminal-state">连接中…</span>',
+      '<span class="grow sub" id="terminal-hint">持久 shell · 关闭标签会断开本地连接</span>',
+      '</div>',
+      '<div class="terminal-host" id="terminal-host"></div>',
+      '<div class="hint">终端走 Instabox WebSocket；远端 shell 在断开后继续运行，重新打开会重放最近输出。</div>',
+    ].join('');
+  }
+
+  function setTerminalState(text, tone) {
+    var node = $('#terminal-state');
+    if (!node) return;
+    node.textContent = text;
+    node.className = 'tag ' + (tone || 'ok');
+  }
+
+  var terminalWrite = function (term, text) {
+    try { term.write(text); } catch (error) { /* ignore */ }
+  };
+
+  function stopTerminal() {
+    var t = state.modal && state.modal.terminal;
+    if (!t) return;
+    t.disposed = true;
+    if (t.timer) { clearInterval(t.timer); t.timer = null; }
+    if (t.observer) { try { t.observer.disconnect(); } catch (error) { /* ignore */ } t.observer = null; }
+    if (t.term) { try { t.term.dispose(); } catch (error) { /* ignore */ } t.term = null; }
+    if (state.modal) state.modal.terminal = null;
+    if (t.sessionId) {
+      void service('DELETE', '/api/terminal/' + encodeURIComponent(t.sessionId), { timeoutMs: 10000 }).catch(function () {});
+    }
+  }
+
+  function stopTerminalPoll(t, text, tone) {
+    if (t.timer) { clearInterval(t.timer); t.timer = null; }
+    if (text) setTerminalState(text, tone || 'bad');
+  }
+
+  function pollTerminal(t) {
+    if (t.disposed || !t.sessionId || t.polling) return;
+    t.polling = true;
+    service('GET', '/api/terminal/' + encodeURIComponent(t.sessionId), {
+      query: { cursor: t.cursor },
+      timeoutMs: 20000,
+    }).then(function (data) {
+      t.polling = false;
+      if (t.disposed || !t.term) return;
+      var info = (data && data.terminal) || {};
+      if (info.reset) {
+        t.cursor = 0;
+        try { t.term.reset(); } catch (error) { /* ignore */ }
+      }
+      var bytes = b64ToBytes(info.chunkB64 || '');
+      if (bytes.length) t.term.write(bytes);
+      if (typeof info.cursor === 'number') t.cursor = info.cursor;
+      if (info.error) setTerminalState(info.error, 'bad');
+      if (info.taken) {
+        stopTerminalPoll(t, info.error || '会话已被另一个窗口接管');
+        return;
+      }
+      if (info.exited) {
+        stopTerminalPoll(t, '进程已退出' + (info.code === null || info.code === undefined ? '' : ' · code ' + info.code), 'bad');
+        return;
+      }
+      if (info.disconnected) {
+        stopTerminalPoll(t, '连接已断开，重新打开终端可恢复会话', 'bad');
+      }
+    }).catch(function (error) {
+      t.polling = false;
+      if (t.disposed) return;
+      if (error && error.code === 'terminal_not_found') stopTerminalPoll(t, '会话已结束', 'bad');
+    });
+  }
+
+  async function startTerminal(machine) {
+    var host = $('#terminal-host');
+    if (!host || !state.modal) return;
+    var t = { disposed: false, timer: null, polling: false, cursor: 0, sessionId: null, term: null, observer: null };
+    state.modal.terminal = t;
+    if (typeof window.Terminal !== 'function') {
+      setTerminalState('xterm 未加载', 'bad');
+      return;
+    }
+    var term = new window.Terminal({
+      fontFamily: '"Cascadia Mono", "JetBrains Mono", Consolas, "Courier New", monospace',
+      fontSize: 13,
+      lineHeight: 1.2,
+      cursorBlink: true,
+      scrollback: 5000,
+      allowTransparency: true,
+      theme: {
+        background: '#0d1117',
+        foreground: '#c9d1d9',
+        cursor: '#10b981',
+        cursorAccent: '#0d1117',
+        selectionBackground: 'rgba(16, 185, 129, 0.28)',
+        black: '#0d1117',
+        red: '#f87171',
+        green: '#10b981',
+        yellow: '#fbbf24',
+        blue: '#60a5fa',
+        magenta: '#c084fc',
+        cyan: '#22d3ee',
+        white: '#c9d1d9',
+        brightBlack: '#6e7681',
+        brightRed: '#fca5a5',
+        brightGreen: '#34d399',
+        brightYellow: '#fde68a',
+        brightBlue: '#93c5fd',
+        brightMagenta: '#d8b4fe',
+        brightCyan: '#67e8f9',
+        brightWhite: '#f0f6fc',
+      },
+    });
+    var fit = null;
+    if (window.FitAddon && typeof window.FitAddon.FitAddon === 'function') {
+      fit = new window.FitAddon.FitAddon();
+      term.loadAddon(fit);
+    }
+    t.term = term;
+    term.open(host);
+    if (fit) { try { fit.fit(); } catch (error) { /* ignore */ } }
+    term.focus();
+
+    term.onResize(function (size) {
+      if (t.disposed || !t.sessionId) return;
+      void service('POST', '/api/terminal/' + encodeURIComponent(t.sessionId) + '/resize', {
+        body: { cols: size.cols, rows: size.rows },
+        timeoutMs: 15000,
+      }).catch(function () {});
+    });
+
+    term.onData(function (data) {
+      if (t.disposed || !t.sessionId) return;
+      void service('POST', '/api/terminal/' + encodeURIComponent(t.sessionId) + '/input', {
+        body: { dataB64: bytesToB64(data) },
+        timeoutMs: 15000,
+      }).catch(function () {});
+    });
+
+    if (window.ResizeObserver) {
+      t.observer = new ResizeObserver(function () {
+        if (t.disposed || !fit) return;
+        try { fit.fit(); } catch (error) { /* ignore */ }
+      });
+      t.observer.observe(host);
+    }
+
+    try {
+      var created = await service('POST', detailBase(machine) + '/terminal', { timeoutMs: 30000 });
+      if (t.disposed) {
+        if (created && created.sessionId) {
+          void service('DELETE', '/api/terminal/' + encodeURIComponent(created.sessionId), { timeoutMs: 10000 }).catch(function () {});
+        }
+        return;
+      }
+      t.sessionId = created.sessionId;
+      t.lastCols = term.cols;
+      t.lastRows = term.rows;
+      setTerminalState('已连接 · ' + (created.session || 'main'), 'ok');
+      terminalWrite(term, '\x1b[38;5;244m会话 ' + (created.session || 'main') + (created.persistent ? '（持久 shell）' : '') + '\x1b[0m\r\n');
+      if (created.sessionId) {
+        void service('POST', '/api/terminal/' + encodeURIComponent(created.sessionId) + '/resize', {
+          body: { cols: term.cols, rows: term.rows },
+          timeoutMs: 15000,
+        }).catch(function () {});
+      }
+      t.timer = setInterval(function () { pollTerminal(t); }, 250);
+      pollTerminal(t);
+    } catch (error) {
+      if (t.disposed) return;
+      setTerminalState(describeError(error), 'bad');
+      terminalWrite(term, '\x1b[38;5;203m' + describeError(error) + '\x1b[0m\r\n');
+    }
+  }
+
   async function loadDetailTab(machine, tab) {
     var body = $('#detail-body');
     if (!body) return;
     if (tab === 'overview') {
       body.innerHTML = detailOverview(machine);
+      return;
+    }
+    if (tab === 'terminal') {
+      body.innerHTML = terminalBody();
+      void startTerminal(machine);
       return;
     }
     if (tab === 'access') {
@@ -2410,12 +2612,14 @@
         if (!state.modal || state.modal.kind !== 'detail') return;
         state.modal.tab = el.dataset.tab || 'overview';
         clearDetailTimer();
+        stopTerminal();
         renderModal();
         return;
       }
       if (act === 'refresh-detail') {
         if (!state.modal || state.modal.kind !== 'detail') return;
         clearDetailTimer();
+        stopTerminal();
         void loadDetailTab(state.modal.machine, state.modal.tab || 'overview');
         return;
       }

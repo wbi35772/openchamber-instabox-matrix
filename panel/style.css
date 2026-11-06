@@ -858,6 +858,22 @@ button:disabled {
 
 .hint { font-size: 10.5px; color: var(--muted); line-height: 1.5; }
 .hint code { font-family: var(--mono); color: var(--text); }
+
+.terminal-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.terminal-host {
+  height: 420px;
+  padding: 8px 6px 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0d1117;
+  overflow: hidden;
+}
+.terminal-host .xterm { height: 100%; }
+.terminal-host .xterm-viewport { background: transparent !important; }
+.terminal-host .xterm-screen { outline: none; }
+@media (max-width: 720px) {
+  .terminal-host { height: 320px; }
+}
 .divider { height: 1px; background: var(--line-soft); }
 
 .code-block {
