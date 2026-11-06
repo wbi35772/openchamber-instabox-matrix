@@ -276,6 +276,42 @@ const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'instabox_ssh_token',
+    description: 'Manage SSH login tokens for an Instabox sandbox: list existing tokens, create one (name and TTL or permanent), or revoke one or all. Create returns the ready-to-paste ssh command.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        operation: { type: 'string', enum: ['list', 'create', 'revoke', 'revoke_all'] },
+        machine_id: { type: 'string', description: 'Sandbox ID (m_...) or exact sandbox name.' },
+        account: { type: 'string', description: 'Account alias; omit for the active account.' },
+        name: { type: 'string', description: 'Token label for create.' },
+        ttl_seconds: { type: 'integer', minimum: 1, maximum: 2592000, description: 'Lifetime for create; default 604800 (7 days).' },
+        no_expiry: { type: 'boolean', description: 'Create a token that never expires; cannot be combined with ttl_seconds.' },
+        token_id: { type: 'string', description: 'Token ID for revoke.' },
+      },
+      required: ['operation', 'machine_id'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'instabox_desktop',
+    description: 'Inspect or control the graphical desktop of an Instabox sandbox, and mint a read-only viewer link. Actions: status (default), install, start, takeover, handback. The stream operation returns a URL with its own token and expiry.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        operation: { type: 'string', enum: ['status', 'install', 'start', 'takeover', 'handback', 'stream', 'stream_state', 'stream_revoke'] },
+        machine_id: { type: 'string', description: 'Sandbox ID (m_...) or exact sandbox name.' },
+        account: { type: 'string', description: 'Account alias; omit for the active account.' },
+        width: { type: 'integer', description: 'Screen width for start, 800-2560.' },
+        height: { type: 'integer', description: 'Screen height for start, 600-1600.' },
+        ttl_seconds: { type: 'integer', minimum: 60, maximum: 86400, description: 'Viewer link lifetime, default 3600.' },
+        token: { type: 'string', description: 'Viewer token for stream_state (the part after #token= in the URL).' },
+      },
+      required: ['operation', 'machine_id'],
+      additionalProperties: false,
+    },
+  },
 ];
 
 async function listMachines(args) {
@@ -715,6 +751,121 @@ async function filesTool(args) {
   return fail(`未知 operation：${operation}`);
 }
 
+function sshCommand(token) {
+  if (token.command) return token.command;
+  if (token.host && token.port && token.token) return `ssh -p ${token.port} ${token.token}@${token.host}`;
+  return '';
+}
+
+async function sshTokenTool(args) {
+  const state = store.load();
+  const account = resolveAccount(state, args.account);
+  const api = client(account, state);
+  const machineId = String(args.machine_id || '').trim();
+  if (!machineId) return fail('machine_id 不能为空');
+  const operation = String(args.operation || 'list');
+
+  if (operation === 'list') {
+    const tokens = await api.listSSHTokens(machineId);
+    if (!tokens.length) return ok(`${machineId} 没有 SSH Token。`);
+    const lines = [`## ${machineId} — SSH Token（${tokens.length}）`, ''];
+    for (const token of tokens) {
+      const status = token.revokedAt ? '已撤销' : token.expiresAt && new Date(token.expiresAt).getTime() < Date.now() ? '已过期' : '有效';
+      const command = sshCommand(token);
+      lines.push(`- **${token.name || token.id}** · ${status} · ${token.expiresAt ? `到期 ${fmtDate(token.expiresAt)}` : '永久'}`);
+      if (command) lines.push(`  \`${command}\``);
+    }
+    return ok(lines.join('\n'));
+  }
+
+  if (operation === 'create') {
+    const token = await api.createSSHToken(machineId, {
+      name: args.name,
+      ttlSeconds: args.ttl_seconds,
+      noExpiry: args.no_expiry === true,
+    });
+    const command = sshCommand(token);
+    const lines = [
+      `## SSH Token 已创建`,
+      '',
+      `- 名称：${token.name || '—'}`,
+      `- 到期：${token.expiresAt ? fmtDate(token.expiresAt) : '永久'}`,
+      '',
+      '```',
+      command || '(API 没有返回命令；用 host/port/token 自行拼接)',
+      '```',
+    ];
+    return ok(lines.join('\n'));
+  }
+
+  if (operation === 'revoke') {
+    const tokenId = String(args.token_id || '').trim();
+    if (!tokenId) return fail('revoke 需要 token_id');
+    await api.revokeSSHToken(machineId, tokenId);
+    return ok(`已撤销 ${tokenId}`);
+  }
+
+  if (operation === 'revoke_all') {
+    const result = await api.revokeAllSSHTokens(machineId);
+    return ok(`已撤销全部 SSH Token（${(result && result.revoked) || 0} 个）`);
+  }
+
+  return fail(`未知 operation：${operation}`);
+}
+
+async function desktopTool(args) {
+  const state = store.load();
+  const account = resolveAccount(state, args.account);
+  const api = client(account, state);
+  const machineId = String(args.machine_id || '').trim();
+  if (!machineId) return fail('machine_id 不能为空');
+  const operation = String(args.operation || 'status');
+
+  if (operation === 'stream') {
+    const stream = await api.desktopStream(machineId, { ttlSeconds: args.ttl_seconds, viewOnly: true });
+    return ok([
+      '## 只读桌面链接',
+      '',
+      `- 到期：${fmtDate(stream.expiresAt)}`,
+      `- 链接：${stream.url}`,
+      '',
+      '链接自带访问 token；只读，输入被服务端丢弃。',
+    ].join('\n'));
+  }
+
+  if (operation === 'stream_state') {
+    const result = await api.desktopStreamState(machineId, { token: args.token });
+    return ok(`链接状态：${(result && result.state) || 'unknown'}`);
+  }
+
+  if (operation === 'stream_revoke') {
+    await api.deleteDesktopStream(machineId);
+    return ok('桌面链接已撤销');
+  }
+
+  if (!['status', 'install', 'start', 'takeover', 'handback'].includes(operation)) {
+    return fail(`未知 operation：${operation}`);
+  }
+
+  const desktop = await api.desktop(machineId, {
+    action: operation,
+    width: args.width,
+    height: args.height,
+  });
+  const label = desktop.running ? '运行中' : desktop.installing ? '安装中' : desktop.installed ? '已安装' : '未安装';
+  const lines = [
+    `## ${machineId} — 桌面`,
+    '',
+    `- 状态：${label}${desktop.failed ? '（失败）' : ''}`,
+    `- kind：${desktop.kind || '—'}`,
+    `- 代理可暂停：${desktop.agentPausable ? '是' : '否'}`,
+  ];
+  if (desktop.controller) lines.push(`- 控制者：${desktop.controller}${desktop.yours ? '（你）' : ''}`);
+  if (desktop.hint) lines.push(`- 下一步：${desktop.hint}`);
+  if (desktop.log) lines.push('', '```', String(desktop.log).slice(-4000), '```');
+  return ok(lines.join('\n'));
+}
+
 async function callTool(name, args) {
   switch (name) {
     case 'instabox_list_machines': return listMachines(args);
@@ -729,6 +880,8 @@ async function callTool(name, args) {
     case 'instabox_fork_machine': return forkMachineTool(args);
     case 'instabox_list_accounts': return ok(accountList(store.load()));
     case 'instabox_files': return filesTool(args);
+    case 'instabox_ssh_token': return sshTokenTool(args);
+    case 'instabox_desktop': return desktopTool(args);
     default: return fail(`未知工具：${name}`);
   }
 }

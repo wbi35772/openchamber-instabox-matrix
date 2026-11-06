@@ -649,6 +649,58 @@ async function route(req, res, url) {
       });
     }
 
+    if (rest[0] === 'ssh-tokens' && rest.length === 1 && method === 'GET') {
+      const tokens = await client.listSSHTokens(machineId);
+      return send(res, 200, { ok: true, tokens });
+    }
+
+    if (rest[0] === 'ssh-tokens' && rest.length === 1 && method === 'POST') {
+      const body = await readBody(req);
+      const token = await client.createSSHToken(machineId, {
+        name: body.name,
+        ttlSeconds: body.ttlSeconds,
+        noExpiry: body.noExpiry === true,
+      });
+      return send(res, 201, { ok: true, token });
+    }
+
+    if (rest[0] === 'ssh-tokens' && rest.length === 1 && method === 'DELETE') {
+      const result = await client.revokeAllSSHTokens(machineId);
+      return send(res, 200, { ok: true, revoked: result && result.revoked });
+    }
+
+    if (rest[0] === 'ssh-tokens' && rest.length === 2 && method === 'DELETE') {
+      await client.revokeSSHToken(machineId, rest[1]);
+      return send(res, 200, { ok: true });
+    }
+
+    if (rest[0] === 'desktop' && rest.length === 1 && method === 'POST') {
+      const body = await readBody(req);
+      return send(res, 200, {
+        ok: true,
+        desktop: await client.desktop(machineId, { action: body.action }),
+      });
+    }
+
+    if (rest[0] === 'desktop' && rest.length === 2 && rest[1] === 'stream' && method === 'POST') {
+      const body = await readBody(req);
+      const stream = await client.desktopStream(machineId, {
+        ttlSeconds: body.ttlSeconds,
+        viewOnly: body.viewOnly !== false,
+      });
+      return send(res, 200, { ok: true, stream });
+    }
+
+    if (rest[0] === 'desktop' && rest.length === 2 && rest[1] === 'stream' && method === 'DELETE') {
+      await client.deleteDesktopStream(machineId);
+      return send(res, 200, { ok: true });
+    }
+
+    if (rest[0] === 'desktop' && rest.length === 2 && rest[1] === 'state' && method === 'GET') {
+      const state = await client.desktopStreamState(machineId, { token: query.token });
+      return send(res, 200, { ok: true, state });
+    }
+
     if (rest.length === 1 && method === 'POST') {
       const action = rest[0];
       const body = await readBody(req);

@@ -1332,7 +1332,7 @@
 
   function openDetail(machine) {
     clearDetailTimer();
-    openModal({ kind: 'detail', machine: machine, tab: 'overview', filePath: '/data' });
+    openModal({ kind: 'detail', machine: machine, tab: 'overview', filePath: '/data', sshCommands: {}, desktopStream: null });
   }
 
   function loadingRow(label) {
@@ -1343,7 +1343,7 @@
     clearDetailTimer();
     var machine = spec.machine;
     var tab = spec.tab || 'overview';
-    var tabs = [['overview', '概览'], ['files', '文件'], ['metrics', '指标'], ['logs', '日志'], ['history', '历史'], ['processes', '进程']];
+    var tabs = [['overview', '概览'], ['access', '访问'], ['files', '文件'], ['metrics', '指标'], ['logs', '日志'], ['history', '历史'], ['processes', '进程']];
     var body = [
       '<div class="status-line"><span class="grow">' + esc(machine.name || machine.id) + ' · ' + esc(machine.account) + '</span><span class="badge ' + stateTone(machine) + '">' + esc(stateLabel(machine)) + '</span></div>',
       '<div class="detail-tabs">' + tabs.map(function (entry) {
@@ -1591,11 +1591,193 @@
     return parts.join('');
   }
 
+  function sshCommand(token) {
+    if (token.command) return token.command;
+    if (token.host && token.port && token.token) {
+      return 'ssh -p ' + token.port + ' ' + token.token + '@' + token.host;
+    }
+    return '';
+  }
+
+  function desktopToken(url) {
+    var hash = String(url || '').split('#')[1] || '';
+    var match = /(?:^|&)token=([^&]+)/.exec(hash);
+    return match ? decodeURIComponent(match[1]) : '';
+  }
+
+  function accessBody(tokens, desktop, stream) {
+    var parts = [];
+    parts.push('<div class="status-line"><span class="grow">SSH Token</span><span class="sub">' + tokens.length + ' 个</span></div>');
+    parts.push([
+      '<div class="file-bar">',
+      '<span class="grow"></span>',
+      '<button class="small-btn" data-act="ssh-create" data-ttl="3600">1 小时</button>',
+      '<button class="small-btn" data-act="ssh-create" data-ttl="86400">24 小时</button>',
+      '<button class="small-btn" data-act="ssh-create" data-ttl="604800">7 天</button>',
+      '<button class="small-btn" data-act="ssh-create" data-ttl="0">永久</button>',
+      '</div>',
+    ].join(''));
+    if (!tokens.length) {
+      parts.push('<div class="list-row"><span class="grow sub">还没有 SSH Token。</span></div>');
+    } else {
+      parts.push('<div class="table-wrap"><table class="detail-table"><thead><tr><th>名称</th><th>到期</th><th>命令</th><th></th></tr></thead><tbody>');
+      tokens.forEach(function (token) {
+        var command = sshCommand(token);
+        if (!command && state.modal && state.modal.sshCommands) command = state.modal.sshCommands[token.id] || '';
+        parts.push([
+          '<tr>',
+          '<td class="mono">' + esc(token.name || token.id) + '</td>',
+          '<td class="mono">' + esc(token.expiresAt ? fmtDate(token.expiresAt) : '永久') + '</td>',
+          '<td class="mono access-command" title="' + esc(command) + '">' + esc(command || '仅在登录会话中显示') + '</td>',
+          '<td class="file-row-actions">',
+          command ? '<button class="small-btn" data-act="copy" data-copy="' + esc(command) + '">复制</button>' : '',
+          '<button class="small-btn" data-act="ssh-revoke" data-token-id="' + esc(token.id) + '">撤销</button>',
+          '</td>',
+          '</tr>',
+        ].join(''));
+      });
+      parts.push('</tbody></table></div>');
+    }
+    parts.push('<div class="divider"></div>');
+    var desktopLabel = desktop.running ? '运行中' : (desktop.installing ? '安装中' : (desktop.installed ? '已安装' : '未安装'));
+    parts.push('<div class="status-line"><span class="grow">桌面</span><span class="tag ' + (desktop.running ? 'ok' : (desktop.failed ? 'bad' : '')) + '">' + esc(desktopLabel) + '</span></div>');
+    if (desktop.error) parts.push('<div class="status-line bad">' + esc(desktop.error) + '</div>');
+    if (desktop.hint) parts.push('<div class="hint">' + esc(desktop.hint) + '</div>');
+    if (desktop.controller) {
+      parts.push('<div class="hint">控制者：' + esc(desktop.controller) + (desktop.yours ? ' · 你' : '') + (desktop.agentPausable === false ? ' · 代理不可暂停' : '') + '</div>');
+    }
+    parts.push('<div class="file-bar">');
+    if (!desktop.installed) {
+      parts.push('<button class="small-btn" data-act="desktop-action" data-desktop-action="install">安装桌面</button>');
+    }
+    if (desktop.installed && !desktop.running) {
+      parts.push('<button class="small-btn" data-act="desktop-action" data-desktop-action="start">启动桌面</button>');
+    }
+    if (desktop.installed) {
+      parts.push('<button class="small-btn" data-act="desktop-action" data-desktop-action="status">刷新状态</button>');
+    }
+    parts.push('<button class="small-btn" data-act="desktop-stream">生成只读链接</button>');
+    if (stream) parts.push('<button class="small-btn" data-act="desktop-revoke">撤销链接</button>');
+    parts.push('</div>');
+    if (stream) {
+      parts.push('<div class="desktop-link"><div class="hint">只读链接 · 有效期至 ' + esc(fmtDate(stream.expiresAt)) + ' · 状态 <span id="desktop-state" class="tag">检查中…</span></div>');
+      parts.push('<div class="ssh-row"><code title="' + esc(stream.url) + '">' + esc(stream.url) + '</code><button data-act="copy" data-copy="' + esc(stream.url) + '" title="复制链接">' + icon('copy') + '</button></div></div>');
+    }
+    return parts.join('');
+  }
+
+  async function createSSHTokenAction(button) {
+    var machine = state.modal && state.modal.machine;
+    if (!machine) return;
+    await withButton(button, async function () {
+      var ttl = Number(button.dataset.ttl) || 0;
+      var body = ttl > 0 ? { ttlSeconds: ttl } : { noExpiry: true };
+      var data = await service('POST', detailBase(machine) + '/ssh-tokens', { body: body, timeoutMs: 30000 });
+      var token = data.token || {};
+      if (state.modal && state.modal.sshCommands && token.id && token.command) {
+        state.modal.sshCommands[token.id] = token.command;
+      }
+      toast(token.expiresAt ? 'SSH Token 已创建，到期 ' + fmtDate(token.expiresAt) : 'SSH Token 已创建（永久）', 'success');
+      void loadDetailTab(machine, 'access');
+    });
+  }
+
+  async function revokeSSHTokenAction(button) {
+    var machine = state.modal && state.modal.machine;
+    if (!machine) return;
+    await withButton(button, async function () {
+      await service('DELETE', detailBase(machine) + '/ssh-tokens/' + encodeURIComponent(button.dataset.tokenId || ''), { timeoutMs: 30000 });
+      if (state.modal && state.modal.sshCommands) delete state.modal.sshCommands[button.dataset.tokenId];
+      toast('SSH Token 已撤销', 'success');
+      void loadDetailTab(machine, 'access');
+    });
+  }
+
+  async function desktopAction(button) {
+    var machine = state.modal && state.modal.machine;
+    if (!machine) return;
+    await withButton(button, async function () {
+      var data = await service('POST', detailBase(machine) + '/desktop', {
+        body: { action: button.dataset.desktopAction || 'status' },
+        timeoutMs: 90000,
+      });
+      var desktop = data.desktop || {};
+      if (desktop.hint) toast(desktop.hint, 'info');
+      void loadDetailTab(machine, 'access');
+    });
+  }
+
+  async function createDesktopStream(button) {
+    var machine = state.modal && state.modal.machine;
+    if (!machine) return;
+    await withButton(button, async function () {
+      var data = await service('POST', detailBase(machine) + '/desktop/stream', {
+        body: { viewOnly: true, ttlSeconds: 3600 },
+        timeoutMs: 30000,
+      });
+      if (state.modal) state.modal.desktopStream = data.stream || {};
+      toast('只读桌面链接已生成', 'success');
+      void loadDetailTab(machine, 'access');
+    });
+  }
+
+  async function revokeDesktopStream(button) {
+    var machine = state.modal && state.modal.machine;
+    if (!machine) return;
+    await withButton(button, async function () {
+      await service('DELETE', detailBase(machine) + '/desktop/stream', { timeoutMs: 30000 });
+      if (state.modal) state.modal.desktopStream = null;
+      toast('桌面链接已撤销', 'success');
+      void loadDetailTab(machine, 'access');
+    });
+  }
+
+  function scheduleDesktopPoll(machine, stream) {
+    clearDetailTimer();
+    var token = desktopToken(stream.url);
+    if (!token) return;
+    var tick = function () {
+      if (!detailOpen(machine, 'access')) { clearDetailTimer(); return; }
+      service('GET', detailBase(machine) + '/desktop/state', {
+        query: { token: token },
+        timeoutMs: 30000,
+      }).then(function (data) {
+        var current = $('#desktop-state');
+        if (!current || !detailOpen(machine, 'access')) return;
+        var value = (data.state && data.state.state) || 'unknown';
+        current.textContent = value;
+        current.className = 'tag ' + (value === 'ok' ? 'ok' : 'bad');
+      }).catch(function () { /* keep last state */ });
+    };
+    tick();
+    detailTimer = setInterval(tick, 30000);
+  }
+
   async function loadDetailTab(machine, tab) {
     var body = $('#detail-body');
     if (!body) return;
     if (tab === 'overview') {
       body.innerHTML = detailOverview(machine);
+      return;
+    }
+    if (tab === 'access') {
+      body.innerHTML = loadingRow('读取访问方式…');
+      try {
+        var tokensData = await service('GET', detailBase(machine) + '/ssh-tokens', { timeoutMs: 30000 });
+        var desktopData = null;
+        try {
+          desktopData = await service('POST', detailBase(machine) + '/desktop', { body: {}, timeoutMs: 90000 });
+        } catch (desktopError) {
+          desktopData = { desktop: { error: describeError(desktopError) } };
+        }
+        if (!detailOpen(machine, 'access')) return;
+        var stream = state.modal && state.modal.desktopStream;
+        body.innerHTML = accessBody(tokensData.tokens || [], (desktopData && desktopData.desktop) || {}, stream);
+        if (stream) scheduleDesktopPoll(machine, stream);
+      } catch (error) {
+        if (!detailOpen(machine, 'access')) return;
+        body.innerHTML = '<div class="status-line bad">' + esc(describeError(error)) + '</div>';
+      }
       return;
     }
     if (tab === 'files') {
@@ -2247,6 +2429,11 @@
       if (act === 'file-preview') { previewFile(el); return; }
       if (act === 'file-download') { downloadFileAction(el); return; }
       if (act === 'file-upload-url') { createUploadLink(el); return; }
+      if (act === 'ssh-create') { createSSHTokenAction(el); return; }
+      if (act === 'ssh-revoke') { revokeSSHTokenAction(el); return; }
+      if (act === 'desktop-action') { desktopAction(el); return; }
+      if (act === 'desktop-stream') { createDesktopStream(el); return; }
+      if (act === 'desktop-revoke') { revokeDesktopStream(el); return; }
       if (act === 'snapshots') { openModal({ kind: 'snapshots', machine: machineFrom(el) }); return; }
       if (act === 'ports') { openModal({ kind: 'ports', machine: machineFrom(el) }); return; }
       if (act === 'attach') {
