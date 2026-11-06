@@ -1,0 +1,488 @@
+'use strict';
+
+const http = require('node:http');
+const crypto = require('node:crypto');
+const store = require('../lib/store');
+const { InstaboxClient, InstaboxError } = require('../lib/instabox');
+const { createKeepalive } = require('../lib/keepalive');
+
+const PORT = Number(process.env.OPENCHAMBER_SERVICE_PORT || 0);
+const TOKEN = String(process.env.OPENCHAMBER_SERVICE_TOKEN || '');
+const HOST = '127.0.0.1';
+const BODY_LIMIT = 2 * 1024 * 1024;
+
+function log(message) {
+  try { process.stderr.write(`[instabox-matrix] ${message}\n`); } catch { /* ignore */ }
+}
+
+if (!PORT || !TOKEN) {
+  log('missing OPENCHAMBER_SERVICE_PORT / OPENCHAMBER_SERVICE_TOKEN');
+  process.exit(1);
+}
+
+const keepalive = createKeepalive({ log });
+const portCache = new Map();
+
+function send(res, status, payload, extraHeaders = {}) {
+  const body = payload === undefined ? '' : JSON.stringify(payload);
+  res.writeHead(status, Object.assign({
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'content-length': Buffer.byteLength(body),
+  }, extraHeaders));
+  res.end(body);
+}
+
+function failure(res, error) {
+  const isKnown = error instanceof InstaboxError;
+  const status = isKnown && error.status >= 400 && error.status < 600 ? error.status : 502;
+  send(res, status, {
+    ok: false,
+    error: {
+      code: isKnown ? error.code : 'internal_error',
+      message: error && error.message ? error.message : String(error),
+      status: isKnown ? error.status : 0,
+      retryable: Boolean(isKnown && error.retryable),
+      retryAfterSeconds: isKnown ? error.retryAfterSeconds : undefined,
+    },
+  });
+}
+
+function authorized(req) {
+  const header = String(req.headers.authorization || '');
+  const expected = `Bearer ${TOKEN}`;
+  if (header.length !== expected.length) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(header), Buffer.from(expected));
+  } catch {
+    return false;
+  }
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > BODY_LIMIT) {
+        reject(new InstaboxError('请求体过大', { code: 'body_too_large', status: 413 }));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      const text = Buffer.concat(chunks).toString('utf8');
+      if (!text) return resolve({});
+      try { resolve(JSON.parse(text)); } catch {
+        reject(new InstaboxError('请求体不是合法 JSON', { code: 'bad_json', status: 400 }));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+function selectedAccounts(state, requested) {
+  if (requested === 'all') return state.accounts.filter((a) => a.enabled !== false);
+  if (requested) {
+    const account = store.findAccount(state, requested);
+    if (!account) throw new InstaboxError(`账号不存在：${requested}`, { code: 'account_not_found', status: 404 });
+    return [account];
+  }
+  const active = store.findAccount(state, '');
+  return active ? [active] : [];
+}
+
+function clientFor(state, alias) {
+  return InstaboxClient.fromAccount(store.findAccount(state, alias), state.settings);
+}
+
+function keepaliveFor(state, alias, machineId) {
+  return state.keepalive.find((k) => k.account === alias && k.machineId === machineId) || null;
+}
+
+async function cachedPorts(client, alias, machineId) {
+  const key = `${alias}:${machineId}`;
+  const hit = portCache.get(key);
+  if (hit && Date.now() - hit.at < 15000) return hit.value;
+  const value = await client.listPorts(machineId).catch(() => null);
+  portCache.set(key, { at: Date.now(), value });
+  return value;
+}
+
+async function overview(state, requested) {
+  const accounts = selectedAccounts(state, requested);
+  const results = await Promise.all(accounts.map(async (account) => {
+    const client = InstaboxClient.fromAccount(account, state.settings);
+    try {
+      const [machines, usage, snapshots] = await Promise.all([
+        client.listMachines(),
+        client.usage().catch((error) => ({ error: error.message })),
+        client.listSnapshots().catch(() => []),
+      ]);
+      const enriched = await Promise.all(machines.map(async (machine) => {
+        const ports = await cachedPorts(client, account.alias, machine.id);
+        const connection = machine.state === 'running'
+          ? await client.connectionInfo(machine.id).catch(() => null)
+          : null;
+        return Object.assign({}, machine, {
+          account: account.alias,
+          ports,
+          connection,
+          keepalive: keepaliveFor(state, account.alias, machine.id),
+        });
+      }));
+      return { alias: account.alias, ok: true, usage, snapshots, machines: enriched };
+    } catch (error) {
+      return {
+        alias: account.alias,
+        ok: false,
+        error: { code: error.code || 'error', message: error.message, status: error.status || 0 },
+        machines: [],
+        snapshots: [],
+        usage: null,
+      };
+    }
+  }));
+  return { ok: true, accounts: results, fetchedAt: new Date().toISOString() };
+}
+
+function identityOf(me) {
+  return {
+    login: me.login || '',
+    name: me.name || '',
+    email: me.email || '',
+    org: me.org ? { id: me.org.id, name: me.org.name, tier: me.org.tier } : null,
+    allowedSpecs: me.allowedSpecs || [],
+    workspaces: me.workspaces || [],
+  };
+}
+
+async function testCredentials(apiKey, gatewayUrl) {
+  const client = new InstaboxClient({
+    apiKey,
+    baseUrl: gatewayUrl || store.load().settings.gatewayUrl || undefined,
+  });
+  const me = await client.me();
+  return identityOf(me);
+}
+
+function mergeAccountMeta(state, alias, identity) {
+  const account = store.setAccountMeta(state, alias, {
+    identity,
+    lastCheckedAt: new Date().toISOString(),
+    lastError: null,
+  });
+  return account;
+}
+
+async function route(req, res, url) {
+  const method = req.method || 'GET';
+  const path = url.pathname;
+  const query = Object.fromEntries(url.searchParams.entries());
+  const parts = path.split('/').filter(Boolean);
+
+  if (method === 'GET' && path === '/health') {
+    return send(res, 200, { ok: true });
+  }
+
+  if (method === 'GET' && path === '/api/bootstrap') {
+    const state = store.load();
+    return send(res, 200, {
+      ok: true,
+      settings: state.settings,
+      accounts: state.accounts.map(store.publicAccount),
+      keepalive: state.keepalive,
+    });
+  }
+
+  if (method === 'GET' && path === '/api/settings') {
+    return send(res, 200, { ok: true, settings: store.load().settings });
+  }
+
+  if (method === 'PUT' && path === '/api/settings') {
+    const body = await readBody(req);
+    const state = store.load();
+    if (body.gatewayUrl !== undefined) state.settings.gatewayUrl = store.normalizeBaseUrl(body.gatewayUrl);
+    if (body.defaultKeepaliveSeconds !== undefined) {
+      state.settings.defaultKeepaliveSeconds = Math.max(30, Math.min(3600, Number(body.defaultKeepaliveSeconds) || 240));
+    }
+    store.save(state);
+    return send(res, 200, { ok: true, settings: state.settings });
+  }
+
+  if (method === 'POST' && path === '/api/test') {
+    const body = await readBody(req);
+    const apiKey = String(body.apiKey || '').trim();
+    if (!apiKey) throw new InstaboxError('缺少 API Key', { code: 'missing_key', status: 400 });
+    const identity = await testCredentials(apiKey, body.gatewayUrl ? store.normalizeBaseUrl(body.gatewayUrl) : '');
+    return send(res, 200, { ok: true, identity });
+  }
+
+  if (path === '/api/accounts') {
+    const state = store.load();
+    if (method === 'GET') {
+      return send(res, 200, { ok: true, accounts: state.accounts.map(store.publicAccount) });
+    }
+    if (method === 'POST') {
+      const body = await readBody(req);
+      const alias = store.normalizeAlias(body.alias);
+      const apiKey = String(body.apiKey || '').trim();
+      if (!apiKey) throw new InstaboxError('缺少 API Key', { code: 'missing_key', status: 400 });
+      if (state.accounts.some((a) => a.alias === alias)) {
+        throw new InstaboxError(`账号别名已存在：${alias}`, { code: 'alias_exists', status: 409 });
+      }
+      const gatewayUrl = body.gatewayUrl ? store.normalizeBaseUrl(body.gatewayUrl) : '';
+      let identity = null;
+      if (!body.skipTest) {
+        try {
+          identity = await testCredentials(apiKey, gatewayUrl);
+        } catch (error) {
+          throw new InstaboxError(`API Key 验证失败：${error.message}`, {
+            code: 'test_failed',
+            status: 400,
+            body: { cause: error.code },
+          });
+        }
+      }
+      const account = {
+        alias,
+        apiKey,
+        gatewayUrl,
+        enabled: true,
+        createdAt: new Date().toISOString(),
+        lastCheckedAt: identity ? new Date().toISOString() : null,
+        identity,
+        lastError: null,
+      };
+      state.accounts.push(account);
+      store.save(state);
+      return send(res, 201, { ok: true, account: store.publicAccount(account) });
+    }
+    throw new InstaboxError('方法不允许', { code: 'method_not_allowed', status: 405 });
+  }
+
+  if (parts[0] === 'api' && parts[1] === 'accounts' && parts[2]) {
+    const alias = decodeURIComponent(parts[2]);
+    const state = store.load();
+    const account = store.findAccount(state, alias);
+    if (!account) throw new InstaboxError(`账号不存在：${alias}`, { code: 'account_not_found', status: 404 });
+    if (method === 'PATCH') {
+      const body = await readBody(req);
+      if (body.apiKey !== undefined) {
+        const apiKey = String(body.apiKey).trim();
+        if (!apiKey) throw new InstaboxError('API Key 不能为空', { code: 'missing_key', status: 400 });
+        account.apiKey = apiKey;
+        account.identity = null;
+        account.lastCheckedAt = null;
+      }
+      if (body.gatewayUrl !== undefined) account.gatewayUrl = store.normalizeBaseUrl(body.gatewayUrl);
+      if (body.enabled !== undefined) account.enabled = Boolean(body.enabled);
+      if (body.retest) {
+        try {
+          account.identity = await testCredentials(account.apiKey, account.gatewayUrl);
+          account.lastCheckedAt = new Date().toISOString();
+          account.lastError = null;
+        } catch (error) {
+          account.lastError = error.message;
+          throw new InstaboxError(`验证失败：${error.message}`, { code: 'test_failed', status: 400 });
+        }
+      }
+      store.save(state);
+      return send(res, 200, { ok: true, account: store.publicAccount(account) });
+    }
+    if (method === 'DELETE') {
+      store.removeAccount(state, alias);
+      store.save(state);
+      portCache.clear();
+      return send(res, 200, { ok: true });
+    }
+    throw new InstaboxError('方法不允许', { code: 'method_not_allowed', status: 405 });
+  }
+
+  if (method === 'GET' && path === '/api/overview') {
+    return send(res, 200, await overview(store.load(), query.account || ''));
+  }
+
+  if (method === 'GET' && path === '/api/usage') {
+    const state = store.load();
+    const accounts = selectedAccounts(state, query.account || '');
+    const data = await Promise.all(accounts.map(async (account) => {
+      try {
+        return { alias: account.alias, ok: true, usage: await InstaboxClient.fromAccount(account, state.settings).usage() };
+      } catch (error) {
+        return { alias: account.alias, ok: false, error: { code: error.code, message: error.message } };
+      }
+    }));
+    return send(res, 200, { ok: true, accounts: data });
+  }
+
+  if (method === 'GET' && path === '/api/snapshots') {
+    const state = store.load();
+    const accounts = selectedAccounts(state, query.account || '');
+    const data = await Promise.all(accounts.map(async (account) => {
+      try {
+        return { alias: account.alias, ok: true, snapshots: await InstaboxClient.fromAccount(account, state.settings).listSnapshots() };
+      } catch (error) {
+        return { alias: account.alias, ok: false, error: { code: error.code, message: error.message } };
+      }
+    }));
+    return send(res, 200, { ok: true, accounts: data });
+  }
+
+  if (parts[0] === 'api' && parts[1] === 'snapshots' && parts[2] && parts[3] && method === 'DELETE') {
+    const state = store.load();
+    const alias = decodeURIComponent(parts[2]);
+    const snapshotId = decodeURIComponent(parts[3]);
+    const client = clientFor(state, alias);
+    await client.deleteSnapshot(snapshotId, snapshotId);
+    return send(res, 200, { ok: true });
+  }
+
+  if (parts[0] === 'api' && parts[1] === 'machines' && parts[2] && parts[3]) {
+    const state = store.load();
+    const alias = decodeURIComponent(parts[2]);
+    const machineId = decodeURIComponent(parts[3]);
+    const rest = parts.slice(4).map(decodeURIComponent);
+    const client = clientFor(state, alias);
+
+    if (rest.length === 0 && method === 'GET') {
+      const [machine, usage] = await Promise.all([
+        client.getMachine(machineId),
+        client.machineUsage(machineId).catch(() => null),
+      ]);
+      return send(res, 200, { ok: true, machine, usage, keepalive: keepaliveFor(state, alias, machineId) });
+    }
+
+    if (rest[0] === 'connection' && method === 'GET') {
+      return send(res, 200, { ok: true, connection: await client.connectionInfo(machineId) });
+    }
+
+    if (rest[0] === 'usage' && method === 'GET') {
+      return send(res, 200, { ok: true, usage: await client.machineUsage(machineId) });
+    }
+
+    if (rest[0] === 'exec' && method === 'POST') {
+      const body = await readBody(req);
+      const cmd = String(body.cmd || '').trim();
+      if (!cmd) throw new InstaboxError('缺少要执行的命令', { code: 'missing_cmd', status: 400 });
+      const result = await client.exec(machineId, cmd, {
+        timeoutSeconds: Math.max(1, Math.min(600, Number(body.timeoutSeconds) || 60)),
+        noHistory: Boolean(body.noHistory),
+      });
+      return send(res, 200, { ok: true, result });
+    }
+
+    if (rest[0] === 'ports' && rest.length === 1) {
+      if (method === 'GET') return send(res, 200, { ok: true, ports: await client.listPorts(machineId) });
+      if (method === 'POST') {
+        const body = await readBody(req);
+        const port = Number(body.port);
+        if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+          throw new InstaboxError('端口必须在 1024-65535 之间', { code: 'bad_port', status: 400 });
+        }
+        const payload = { port };
+        if (body.name) payload.name = String(body.name).slice(0, 100);
+        if (body.access) payload.access = body.access === 'private' ? 'private' : 'public';
+        if (body.protocol) payload.protocol = body.protocol === 'tcp' ? 'tcp' : 'http';
+        portCache.delete(`${alias}:${machineId}`);
+        return send(res, 200, { ok: true, port: await client.publishPort(machineId, payload) });
+      }
+    }
+
+    if (rest[0] === 'ports' && rest.length === 2 && method === 'DELETE') {
+      portCache.delete(`${alias}:${machineId}`);
+      await client.unpublishPort(machineId, rest[1]);
+      return send(res, 200, { ok: true });
+    }
+
+    if (rest[0] === 'snapshots' && method === 'POST') {
+      const body = await readBody(req);
+      const name = String(body.name || '').trim();
+      if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(name)) {
+        throw new InstaboxError('快照名需为 1-63 位小写字母、数字或短横线，并以字母或数字开头', { code: 'bad_snapshot_name', status: 400 });
+      }
+      const payload = { name };
+      if (body.description) payload.description = String(body.description).slice(0, 500);
+      if (body.rootOnly) payload.rootOnly = true;
+      return send(res, 200, { ok: true, snapshot: await client.snapshot(machineId, payload) });
+    }
+
+    if (rest[0] === 'keepalive' && method === 'PUT') {
+      const body = await readBody(req);
+      const entry = store.upsertKeepalive(state, {
+        account: alias,
+        machineId,
+        machineName: body.machineName || '',
+        intervalSeconds: body.intervalSeconds,
+        enabled: Boolean(body.enabled),
+      });
+      store.save(state);
+      if (entry) void keepalive.tick();
+      return send(res, 200, { ok: true, keepalive: entry });
+    }
+
+    if (rest.length === 1 && rest[0] === 'restore' && method === 'POST') {
+      const body = await readBody(req);
+      const payload = {};
+      if (body.snapshotId) payload.snapshotId = String(body.snapshotId);
+      if (body.desiredState) payload.desiredState = body.desiredState === 'stopped' ? 'stopped' : 'running';
+      return send(res, 200, { ok: true, operation: await client.power(machineId, 'restore', { body: payload }) });
+    }
+
+    if (rest.length === 1 && method === 'POST') {
+      const action = rest[0];
+      const body = await readBody(req);
+      if (action === 'delete') {
+        const confirm = String(body.confirm || '');
+        if (!confirm) throw new InstaboxError('删除需要 confirm（机器 ID 或名称）', { code: 'confirm_required', status: 400 });
+        const operation = await client.power(machineId, 'delete', { confirm });
+        return send(res, 200, { ok: true, operation });
+      }
+      if (['start', 'stop', 'suspend', 'resume', 'wake'].includes(action)) {
+        const operation = await client.power(machineId, action);
+        return send(res, 200, { ok: true, operation });
+      }
+      throw new InstaboxError(`未知操作：${action}`, { code: 'bad_action', status: 400 });
+    }
+
+    throw new InstaboxError('接口不存在', { code: 'not_found', status: 404 });
+  }
+
+  throw new InstaboxError('接口不存在', { code: 'not_found', status: 404 });
+}
+
+const server = http.createServer(async (req, res) => {
+  try {
+    if (!authorized(req)) {
+      return send(res, 401, { ok: false, error: { code: 'unauthorized', message: 'Missing or invalid service token' } });
+    }
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, { 'cache-control': 'no-store' });
+      return res.end();
+    }
+    const url = new URL(req.url || '/', `http://${HOST}:${PORT}`);
+    await route(req, res, url);
+  } catch (error) {
+    if (!res.headersSent) failure(res, error);
+    else res.end();
+  }
+});
+
+server.listen(PORT, HOST, () => {
+  log(`listening on ${HOST}:${PORT}`);
+  keepalive.start();
+  void keepalive.tick();
+});
+
+let shuttingDown = false;
+function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  keepalive.stop();
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 2000).unref();
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);

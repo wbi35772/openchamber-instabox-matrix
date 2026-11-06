@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Instabox Matrix</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <span></span><span></span><span></span><span></span>
+        </div>
+        <div class="brand-text">
+          <strong>INSTABOX</strong>
+          <em>MATRIX</em>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <label class="account-picker">
+          <span>账号</span>
+          <select id="account-select" aria-label="选择账号">
+            <option value="all">全部账号</option>
+          </select>
+        </label>
+        <button class="icon-btn" data-act="refresh" title="刷新" aria-label="刷新">
+          <svg viewBox="0 0 24 24"><path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"/></svg>
+        </button>
+        <button class="icon-btn" data-act="settings" title="设置" aria-label="设置">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09A1.7 1.7 0 0 0 15 4.6a1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9c.12.36.42.67.79.79H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1.21Z"/></svg>
+        </button>
+        <button class="primary-btn" data-act="add-account">
+          <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+          添加账号
+        </button>
+      </div>
+    </header>
+
+    <section class="accounts" id="accounts"></section>
+
+    <section class="stats" id="stats"></section>
+
+    <section class="toolbar">
+      <div class="filter">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input id="filter-input" type="search" placeholder="过滤机器名 / ID / 模板…" autocomplete="off" />
+      </div>
+      <div class="toolbar-meta" id="toolbar-meta"></div>
+    </section>
+
+    <main id="grid" class="grid" aria-live="polite"></main>
+
+    <section class="footer">
+      <span id="footer-status">等待连接…</span>
+      <span class="footer-hint">Instabox API · 本地服务代理 · Key 不进入面板</span>
+    </section>
+  </div>
+
+  <div id="toast-root" class="toast-root"></div>
+  <div id="modal-root"></div>
+
+  <script src="./main.js"></script>
+</body>
+</html>

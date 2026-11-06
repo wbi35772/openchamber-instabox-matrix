@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Instabox Matrix">
+  <rect width="64" height="64" rx="14" fill="#0d1117"/>
+  <rect x="0.75" y="0.75" width="62.5" height="62.5" rx="13.25" fill="none" stroke="#10b981" stroke-opacity="0.35"/>
+  <g fill="#10b981">
+    <rect x="14" y="14" width="16" height="16" rx="3"/>
+    <rect x="34" y="14" width="16" height="16" rx="3" opacity="0.45"/>
+    <rect x="14" y="34" width="16" height="16" rx="3" opacity="0.7"/>
+    <rect x="34" y="34" width="16" height="16" rx="3" opacity="0.3"/>
+  </g>
+</svg>
