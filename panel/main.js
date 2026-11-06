@@ -305,6 +305,7 @@
       check: '<path d="m4 12 5 5L20 6"/>',
       external: '<path d="M14 4h6v6M20 4l-9 9"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>',
       chip: '<rect x="7" y="7" width="10" height="10" rx="1.5"/><path d="M9 3v4M15 3v4M9 17v4M15 17v4M3 9h4M3 15h4M17 9h4M17 15h4"/>',
+      globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/>',
     };
     return '<svg viewBox="0 0 24 24" aria-hidden="true">' + (paths[name] || paths.info) + '</svg>';
   }
@@ -673,7 +674,39 @@
       ssh = '<div class="ssh-row"><span class="label">SSH</span><code style="color:var(--dim)">读取连接信息中…</code></div>';
     }
 
-    var keepalive = machine.keepalive || null;
+    function networkRow(machine) {
+    var label = '<span class="label">NET</span>';
+    if (machine.state !== 'running') {
+      return '<div class="net-row"><span class="label">NET</span><code class="dim">—（需运行）</code></div>';
+    }
+    var probeButton = '<button class="net-probe" data-act="probe-net" data-machine="' + esc(machine.id) + '" data-account="' + esc(machine.account) + '" title="探测网络">' + icon('globe') + '</button>';
+    var net = machine.network;
+    if (!net) {
+      return '<div class="net-row">' + label + '<code class="dim">未探测</code>' + probeButton + '</div>';
+    }
+    var chips = [];
+    if (net.ok === false) {
+      chips.push('<span class="net-chip bad" title="' + esc(net.error || '探测失败') + '">探测失败</span>');
+    }
+    (net.v6 || []).forEach(function (entry) {
+      chips.push('<code class="net-chip v6" title="' + esc(entry.iface + ' ' + entry.cidr) + '">v6 ' + esc(entry.cidr) + '</code>');
+    });
+    if (!net.v6 || !net.v6.length) {
+      if (net.egressV6) chips.push('<code class="net-chip v6" title="出站 IPv6">v6 ' + esc(net.egressV6) + '</code>');
+    }
+    (net.v4 || []).forEach(function (entry) {
+      chips.push('<code class="net-chip v4" title="' + esc(entry.iface + ' ' + entry.cidr) + '">v4 ' + esc(entry.cidr) + '</code>');
+    });
+    if (net.egressV4) {
+      chips.push('<code class="net-chip e4" title="出站 IPv4（共享 NAT）">E4 ' + esc(net.egressV4) + '</code>');
+    }
+    if (!chips.length) chips.push('<code class="dim">无地址</code>');
+    var at = net.at ? String(net.at).slice(11, 16) : '';
+    return '<div class="net-row">' + label + chips.join('') +
+      (at ? '<span class="net-at">' + esc(at) + '</span>' : '') + probeButton + '</div>';
+  }
+
+  var keepalive = machine.keepalive || null;
     var keepaliveClasses = ['keepalive'];
     if (keepalive) keepaliveClasses.push(keepalive.lastOk === false ? 'error' : 'on');
     var ttls = [300, 900, 1800, 3600];
@@ -709,6 +742,7 @@
       '</div>',
 
       ssh,
+      networkRow(machine),
       portsBlock(machine),
 
       '<div class="' + keepaliveClasses.join(' ') + '">',
@@ -1102,6 +1136,40 @@
       .then(function () { setTimeout(function () { refresh({ silent: true }); }, 800); });
   }
 
+  async function probeNetwork(machineIds, button) {
+    var list = filteredMachines().filter(function (machine) {
+      return machine.state === 'running' && (!machineIds || machineIds.indexOf(machine.id) >= 0);
+    });
+    if (!list.length) { toast('没有运行中的机器可探测', 'error'); return; }
+    var keys = list.map(function (machine) { return machine.account + ':' + machine.id; });
+    var deadline = Date.now() + Math.min(60000, 12000 + list.length * 6000);
+    var done = false;
+
+    await withButton(button, async function () {
+      await service('POST', '/api/netprobe', {
+        body: {
+          account: state.selected,
+          machineIds: list.map(function (machine) { return machine.id; }),
+        },
+        timeoutMs: 20000,
+      });
+      while (Date.now() < deadline) {
+        await new Promise(function (resolve) { setTimeout(resolve, 1200); });
+        var cached = await service('GET', '/api/netprobe', {
+          query: { account: state.selected },
+          timeoutMs: 15000,
+        });
+        var seen = {};
+        (cached.network || []).forEach(function (item) {
+          seen[item.account + ':' + item.machineId] = true;
+        });
+        if (keys.every(function (key) { return seen[key]; })) { done = true; break; }
+      }
+      await refresh({ silent: true });
+      toast(done ? ('网络信息已更新：' + keys.length + ' 台') : '探测仍在进行，稍后自动刷出', done ? 'success' : 'info');
+    });
+  }
+
   async function toggleKeepalive(input) {
     var machineId = input.dataset.machine;
     var alias = input.dataset.account;
@@ -1417,6 +1485,8 @@
       }
 
       if (act === 'refresh') { refresh(); return; }
+      if (act === 'probe-net') { probeNetwork([el.dataset.machine], el); return; }
+      if (act === 'probe-net-all') { probeNetwork(null, el); return; }
       if (act === 'settings') { openModal({ kind: 'settings' }); return; }
       if (act === 'add-account') { openModal({ kind: 'account' }); return; }
       if (act === 'edit-account') {

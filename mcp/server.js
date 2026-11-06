@@ -4,6 +4,7 @@ const readline = require('node:readline');
 const store = require('../lib/store');
 const { InstaboxClient, InstaboxError } = require('../lib/instabox');
 const { createKeepalive } = require('../lib/keepalive');
+const { createNetProbe } = require('../lib/netprobe');
 
 const SERVER_NAME = 'instabox-matrix';
 const SERVER_VERSION = '1.0.0';
@@ -77,6 +78,8 @@ function resolveAccount(state, alias) {
 function client(account, state) {
   return InstaboxClient.fromAccount(account, state.settings);
 }
+
+const netprobe = createNetProbe();
 
 const TOOLS = [
   {
@@ -172,6 +175,20 @@ const TOOLS = [
         knock_url: { type: 'string', description: 'Published port URL to poll for knock mode.' },
       },
       required: ['operation'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'instabox_network_info',
+    description: 'Probe and cache the public IPv4/IPv6 addresses of a running Instabox sandbox (interface addresses plus egress IPs).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        machine_id: { type: 'string', description: 'Sandbox ID or name.' },
+        account: { type: 'string', description: 'Account alias; omit for the active account.' },
+        refresh: { type: 'boolean', description: 'Force a fresh probe instead of the 10 minute cache.' },
+      },
+      required: ['machine_id'],
       additionalProperties: false,
     },
   },
@@ -382,6 +399,24 @@ async function keepaliveTool(args) {
   return fail(`未知 operation：${operation}`);
 }
 
+async function networkTool(args) {
+  const state = store.load();
+  const account = resolveAccount(state, args.account);
+  const machineId = String(args.machine_id || '').trim();
+  if (!machineId) return fail('machine_id 不能为空');
+  const api = client(account, state);
+  const info = await netprobe.probe(api, account.alias, machineId, { force: args.refresh === true });
+  const lines = [`## ${machineId} — 网络`];
+  if (info.ok === false) lines.push(`⚠ 探测失败：${info.error || 'unknown'}`);
+  for (const entry of info.v6 || []) lines.push(`- v6 ${entry.iface}: ${entry.cidr}`);
+  if (!(info.v6 || []).length && info.egressV6) lines.push(`- v6 出站：${info.egressV6}`);
+  for (const entry of info.v4 || []) lines.push(`- v4 ${entry.iface}: ${entry.cidr}`);
+  if (info.egressV4) lines.push(`- v4 出站（共享 NAT）：${info.egressV4}`);
+  if (!(info.v4 || []).length && !(info.v6 || []).length && !info.egressV4 && !info.egressV6) lines.push('- 没读到地址');
+  lines.push(`\n探测时间：${fmtDate(info.at)}`);
+  return ok(lines.join('\n'));
+}
+
 async function callTool(name, args) {
   switch (name) {
     case 'instabox_list_machines': return listMachines(args);
@@ -390,6 +425,7 @@ async function callTool(name, args) {
     case 'instabox_manage_snapshot': return manageSnapshot(args);
     case 'instabox_expose_port': return exposePort(args);
     case 'instabox_keepalive': return keepaliveTool(args);
+    case 'instabox_network_info': return networkTool(args);
     case 'instabox_list_accounts': return ok(accountList(store.load()));
     default: return fail(`未知工具：${name}`);
   }

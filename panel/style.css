@@ -518,6 +518,54 @@ button:disabled {
 }
 .ssh-row button:hover { color: var(--green); }
 
+.net-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 7px 9px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: rgba(13, 17, 23, 0.6);
+}
+.net-row .label {
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+.net-row code.dim { font-size: 10.5px; }
+.net-chip {
+  padding: 2px 6px;
+  border: 1px solid var(--line-soft);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.03);
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted);
+  word-break: break-all;
+}
+.net-chip.v6 { color: #67e8f9; border-color: rgba(103, 232, 249, 0.25); }
+.net-chip.v4 { color: var(--muted); }
+.net-chip.e4 { color: var(--purple); border-color: rgba(167, 139, 250, 0.3); }
+.net-chip.bad { color: #fca5a5; border-color: rgba(239, 68, 68, 0.4); background: rgba(239, 68, 68, 0.08); }
+.net-at {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--dim);
+}
+.net-probe {
+  border: 0;
+  background: transparent;
+  color: var(--dim);
+  padding: 0;
+  display: inline-flex;
+}
+.net-probe:hover { color: var(--green); }
+.net-probe svg { width: 13px; height: 13px; }
+.net-probe[data-busy="1"] { color: var(--green); }
+
 .ports {
   display: flex;
   flex-wrap: wrap;

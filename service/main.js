@@ -6,6 +6,7 @@ const store = require('../lib/store');
 const { InstaboxClient, InstaboxError } = require('../lib/instabox');
 const { createKeepalive } = require('../lib/keepalive');
 const { createJobs } = require('../lib/jobs');
+const { createNetProbe } = require('../lib/netprobe');
 
 const PORT = Number(process.env.OPENCHAMBER_SERVICE_PORT || 0);
 const TOKEN = String(process.env.OPENCHAMBER_SERVICE_TOKEN || '');
@@ -23,6 +24,7 @@ if (!PORT || !TOKEN) {
 
 const keepalive = createKeepalive({ log });
 const jobs = createJobs();
+const netprobe = createNetProbe();
 const portCache = new Map();
 
 function send(res, status, payload, extraHeaders = {}) {
@@ -113,6 +115,22 @@ async function cachedPorts(client, alias, machineId) {
   return value;
 }
 
+async function probeBatch(targets, force) {
+  const queue = targets.slice();
+  const workerCount = Math.min(2, queue.length);
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (queue.length) {
+      const target = queue.shift();
+      try {
+        await netprobe.probe(target.client, target.account, target.machineId, { force });
+      } catch (error) {
+        log(`netprobe failed ${target.account}/${target.machineId}: ${error.message}`);
+      }
+    }
+  });
+  await Promise.all(workers);
+}
+
 async function overview(state, requested) {
   const accounts = selectedAccounts(state, requested);
   const results = await Promise.all(accounts.map(async (account) => {
@@ -133,6 +151,7 @@ async function overview(state, requested) {
           ports,
           connection,
           keepalive: keepaliveFor(state, account.alias, machine.id),
+          network: netprobe.get(account.alias, machine.id),
         });
       }));
       return { alias: account.alias, ok: true, usage, snapshots, machines: enriched };
@@ -308,6 +327,42 @@ async function route(req, res, url) {
 
   if (method === 'GET' && path === '/api/keepalive') {
     return send(res, 200, { ok: true, keepalive: store.load().keepalive });
+  }
+
+  if (method === 'GET' && path === '/api/netprobe') {
+    return send(res, 200, {
+      ok: true,
+      network: netprobe.snapshot(query.account || 'all'),
+      fetchedAt: new Date().toISOString(),
+    });
+  }
+
+  if (method === 'POST' && path === '/api/netprobe') {
+    const body = await readBody(req);
+    const state = store.load();
+    const accounts = selectedAccounts(state, body.account || 'all');
+    const wanted = Array.isArray(body.machineIds) && body.machineIds.length
+      ? new Set(body.machineIds.map(String))
+      : null;
+    const targets = [];
+    for (const account of accounts) {
+      const client = InstaboxClient.fromAccount(account, state.settings);
+      let machines;
+      try {
+        machines = await client.listMachines();
+      } catch (error) {
+        log(`netprobe list failed ${account.alias}: ${error.message}`);
+        continue;
+      }
+      for (const machine of machines) {
+        if (machine.state !== 'running') continue;
+        if (machine.runtime && machine.runtime.ready === false) continue;
+        if (wanted && !wanted.has(machine.id)) continue;
+        targets.push({ account: account.alias, machineId: machine.id, client });
+      }
+    }
+    if (targets.length) void probeBatch(targets, Boolean(body.force));
+    return send(res, 202, { ok: true, accepted: targets.length, running: targets.length > 0 });
   }
 
   if (method === 'POST' && path === '/api/keepalive/tick') {
