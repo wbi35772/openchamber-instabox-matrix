@@ -808,6 +808,10 @@
         return '<option value="' + value + '"' + (value === ttl ? ' selected' : '') + '>' + Math.round(value / 60) + 'm</option>';
       }).join(''),
       '</select>',
+      '<label class="ka-auto" title="最长运行冷却结束后自动 wake/resume 再续租；免费计划冷却会递增">',
+      '<input type="checkbox" data-change="keepalive-autowake" data-machine="' + esc(machine.id) + '" data-account="' + esc(machine.account) + '"' + (keepalive && keepalive.autoWake ? ' checked' : '') + ' />',
+      '<span>冷却唤醒</span>',
+      '</label>',
       '</div>',
       '<label class="switch" title="保持唤醒">',
       '<input type="checkbox" data-change="keepalive-toggle" data-machine="' + esc(machine.id) + '" data-account="' + esc(machine.account) + '" data-name="' + esc(machine.name || '') + '"' + (keepalive ? ' checked' : '') + ' />',
@@ -2241,10 +2245,12 @@
   function keepaliveBody(row, enabled, machineName) {
     var modeSelect = row ? row.querySelector('select[data-change="keepalive-mode"]') : null;
     var ttlSelect = row ? row.querySelector('select[data-change="keepalive-ttl"]') : null;
+    var autoInput = row ? row.querySelector('input[data-change="keepalive-autowake"]') : null;
     return {
       enabled: enabled,
       mode: modeSelect ? modeSelect.value : 'lease',
       ttlSeconds: ttlSelect ? Number(ttlSelect.value) : undefined,
+      autoWake: autoInput ? autoInput.checked : false,
       machineName: machineName || '',
     };
   }
@@ -2297,7 +2303,7 @@
     var body = keepaliveBody(row, enabled, input.dataset.name || '');
     try {
       await service('PUT', '/api/machines/' + encodeURIComponent(alias) + '/' + encodeURIComponent(machineId) + '/keepalive', { body: body });
-      toast(enabled ? ('Keepalive 已开启（' + body.mode + '，TTL ' + Math.round((body.ttlSeconds || 900) / 60) + 'm）') : 'Keepalive 已关闭', 'success');
+      toast(enabled ? ('Keepalive 已开启（' + body.mode + '，TTL ' + Math.round((body.ttlSeconds || 900) / 60) + 'm' + (body.autoWake ? '，冷却唤醒' : '') + '）') : 'Keepalive 已关闭', 'success');
       if (enabled) tickKeepalive();
       else refresh({ silent: true });
     } catch (error) {
@@ -2311,7 +2317,7 @@
     var alias = select.dataset.account;
     var row = select.closest('.keepalive');
     if (!row) return;
-    var toggle = row.querySelector('input[type="checkbox"]');
+    var toggle = row.querySelector('input[data-change="keepalive-toggle"]');
     if (!toggle || !toggle.checked) return;
     try {
       await service('PUT', '/api/machines/' + encodeURIComponent(alias) + '/' + encodeURIComponent(machineId) + '/keepalive', {
@@ -2709,6 +2715,7 @@
       if (el.dataset.change === 'keepalive-toggle') toggleKeepalive(el);
       if (el.dataset.change === 'keepalive-mode') updateKeepaliveOption(el);
       if (el.dataset.change === 'keepalive-ttl') updateKeepaliveOption(el);
+      if (el.dataset.change === 'keepalive-autowake') updateKeepaliveOption(el);
     });
 
     document.addEventListener('input', function (event) {

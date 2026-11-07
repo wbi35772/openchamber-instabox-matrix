@@ -1,4 +1,4 @@
-# Instabox Matrix 1.2.0 验收清单
+# Instabox Matrix 1.3.0 验收清单
 
 一次完整验收的做法：本机 Windows + OpenChamber，扩展服务由宿主启动（也可用 `node service/main.js` 加 `OPENCHAMBER_SERVICE_PORT` / `OPENCHAMBER_SERVICE_TOKEN` 手工启动）。所有 API 调用都经账号自己的 API Key 发往 Instabox Gateway，面板从不接触 Key。
 
@@ -114,6 +114,16 @@
 ## 13. 面板完整性
 
 详情 tab 依次为：概览、访问、文件、终端、指标、日志、历史、进程。切换 tab 会停止上一个轮询（终端会 DELETE 会话，桌面链接轮询停止），关闭弹窗不留下定时器。
+
+## 14. 冷却自动唤醒（1.3.0）
+
+1. 机器卡片 Keepalive 行勾选「冷却唤醒」，PUT `/api/machines/{alias}/{id}/keepalive` 返回 `autoWake: true`。
+2. 冷却期间（`retryAt` 未到）不会调用 wake，租约按退避跳过。
+3. `retryAt` 到点后先 POST wake；失败按 wake → resume → start 回退，成功后再 PUT 活动租约。
+4. API 仍返回 409 `machine_cooldown` 时保留新的 `retryAfterSeconds`，不续租，也不每分钟重试。
+5. MCP `instabox_keepalive status` 的「冷却唤醒」列显示上次动作（如 `resume 18:06`）或「待命」；`set` 传 `auto_wake: true` 开启。
+6. 单元测试：`tests/leases.test.js` 覆盖默认关闭、wake 成功、wake → resume → start 回退、冷却退避、1 分钟唤醒防抖。
+7. 待实测：冷却结束后确认 wake/resume 成功、租约恢复、`runStartedAt` 重置。
 
 ## 已知限制
 

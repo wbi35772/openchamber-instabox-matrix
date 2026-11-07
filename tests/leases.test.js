@@ -20,7 +20,7 @@ function makeEntry(overrides = {}) {
   }, overrides);
 }
 
-function fakeClient(putLease, deleteLease) {
+function fakeClient(putLease, deleteLease, power) {
   const calls = [];
   return {
     calls,
@@ -31,6 +31,10 @@ function fakeClient(putLease, deleteLease) {
     async deleteLease(machineId, leaseId) {
       calls.push(['deleteLease', machineId, leaseId]);
       return deleteLease(machineId, leaseId);
+    },
+    async power(machineId, action) {
+      calls.push(['power', machineId, action]);
+      return power ? power(machineId, action) : { ok: true };
     },
   };
 }
@@ -178,4 +182,152 @@ test('knock mode without a url reports an error instead of calling fetch', async
   assert.equal(called, false);
   assert.equal(patches[0].patch.lastOk, false);
   assert.match(patches[0].patch.lastError, /knockUrl/);
+});
+
+test('autoWake is off by default: a past retry renews the lease without power', async () => {
+  const client = fakeClient(() => ({ expiresAt: iso(T0 + 900000) }));
+  const entry = makeEntry({ expiresAt: iso(T0 + 1000), leaseId: 'oc-x', retryAt: iso(T0 - 1000) });
+
+  const patches = await tickEntries([entry], { now: () => T0, clientFor: () => client });
+
+  assert.equal(client.calls.filter((call) => call[0] === 'power').length, 0);
+  assert.equal(patches[0].patch.lastOk, true);
+  assert.equal(patches[0].patch.retryAt, null);
+});
+
+test('autoWake wakes after retryAt, then renews the lease', async () => {
+  const client = fakeClient(
+    () => ({ expiresAt: iso(T0 + 900000) }),
+    undefined,
+    () => ({ state: 'running' }),
+  );
+  const entry = makeEntry({
+    expiresAt: iso(T0 + 1000),
+    leaseId: 'oc-x',
+    retryAt: iso(T0 - 1000),
+    autoWake: true,
+  });
+
+  const patches = await tickEntries([entry], { now: () => T0, clientFor: () => client });
+
+  assert.deepEqual(client.calls.map((call) => call[0]), ['power', 'putLease']);
+  assert.deepEqual(client.calls[0], ['power', 'm_demo', 'wake']);
+  assert.equal(patches[0].patch.lastWakeAction, 'wake');
+  assert.equal(patches[0].patch.lastWakeAt, iso(T0));
+  assert.equal(patches[0].patch.lastOk, true);
+  assert.equal(patches[0].patch.retryAt, null);
+});
+
+test('autoWake falls back from wake to resume to start', async () => {
+  const seen = [];
+  const client = fakeClient(
+    () => ({ expiresAt: iso(T0 + 900000) }),
+    undefined,
+    (machineId, action) => {
+      seen.push(action);
+      if (action !== 'start') {
+        throw new InstaboxError('not running', { status: 409, code: 'machine_not_running' });
+      }
+      return { state: 'starting' };
+    },
+  );
+  const entry = makeEntry({
+    expiresAt: iso(T0 + 1000),
+    leaseId: 'oc-x',
+    retryAt: iso(T0 - 1000),
+    autoWake: true,
+  });
+
+  const patches = await tickEntries([entry], { now: () => T0, clientFor: () => client });
+
+  assert.deepEqual(seen, ['wake', 'resume', 'start']);
+  assert.equal(patches[0].patch.lastWakeAction, 'start');
+  assert.equal(patches[0].patch.lastOk, true);
+});
+
+test('autoWake respects machine_cooldown and backs off without renewing', async () => {
+  let leaseCalls = 0;
+  const client = fakeClient(
+    () => {
+      leaseCalls += 1;
+      return { expiresAt: iso(T0 + 900000) };
+    },
+    undefined,
+    () => {
+      throw new InstaboxError('machine is cooling down', {
+        status: 409,
+        code: 'machine_cooldown',
+        retryAfterSeconds: 3600,
+      });
+    },
+  );
+  const entry = makeEntry({
+    expiresAt: iso(T0 + 1000),
+    leaseId: 'oc-x',
+    retryAt: iso(T0 - 1000),
+    autoWake: true,
+  });
+
+  const patches = await tickEntries([entry], { now: () => T0, clientFor: () => client });
+
+  assert.equal(leaseCalls, 0);
+  assert.equal(patches[0].patch.lastOk, false);
+  assert.equal(patches[0].patch.retryAt, iso(T0 + 3600000));
+  assert.match(patches[0].patch.lastError, /cooling down/);
+});
+
+test('autoWake does not wake while retryAt is in the future or without a backoff', async () => {
+  let powerCalls = 0;
+  const client = fakeClient(
+    () => ({ expiresAt: iso(T0 + 900000) }),
+    undefined,
+    () => {
+      powerCalls += 1;
+      return {};
+    },
+  );
+  const future = makeEntry({
+    expiresAt: iso(T0 + 1000),
+    leaseId: 'oc-x',
+    retryAt: iso(T0 + 60000),
+    autoWake: true,
+  });
+  const skipped = await tickEntries([future], { now: () => T0, clientFor: () => client });
+  assert.equal(skipped.length, 0);
+
+  const normal = makeEntry({ expiresAt: iso(T0 + 1000), leaseId: 'oc-x', autoWake: true });
+  const renewed = await tickEntries([normal], { now: () => T0, clientFor: () => client });
+  assert.equal(powerCalls, 0);
+  assert.equal(renewed[0].patch.lastOk, true);
+});
+
+test('autoWake retries a failed wake at most once a minute', async () => {
+  let powerCalls = 0;
+  const client = fakeClient(
+    () => {
+      throw new InstaboxError('lease unavailable', { status: 500 });
+    },
+    undefined,
+    () => {
+      powerCalls += 1;
+      throw new InstaboxError('already waking', { status: 409, code: 'operation_conflict' });
+    },
+  );
+  const entry = makeEntry({
+    expiresAt: iso(T0 + 1000),
+    leaseId: 'oc-x',
+    retryAt: iso(T0 - 1000),
+    autoWake: true,
+  });
+
+  const first = await tickEntries([entry], { now: () => T0, clientFor: () => client });
+  assert.equal(powerCalls, 1);
+  assert.equal(first[0].patch.lastWakeAt, iso(T0));
+
+  const merged = Object.assign({}, entry, first[0].patch);
+  await tickEntries([merged], { now: () => T0 + 15000, clientFor: () => client });
+  assert.equal(powerCalls, 1);
+
+  await tickEntries([merged], { now: () => T0 + 61000, clientFor: () => client });
+  assert.equal(powerCalls, 2);
 });

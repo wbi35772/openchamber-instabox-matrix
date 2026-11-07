@@ -624,6 +624,7 @@ async function route(req, res, url) {
         mode: body.mode,
         ttlSeconds: body.ttlSeconds,
         knockUrl: body.knockUrl,
+        autoWake: body.autoWake,
         enabled,
       });
       store.save(state);

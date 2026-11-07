@@ -8,7 +8,7 @@ const { createNetProbe } = require('../lib/netprobe');
 const { machineUptime } = require('../lib/uptime');
 
 const SERVER_NAME = 'instabox-matrix';
-const SERVER_VERSION = '1.2.0';
+const SERVER_VERSION = '1.3.0';
 
 function log(message) {
   try { process.stderr.write(`[instabox-matrix-mcp] ${message}\n`); } catch { /* ignore */ }
@@ -179,7 +179,7 @@ const TOOLS = [
   },
   {
     name: 'instabox_keepalive',
-    description: 'Manage the official Instabox activity lease (prevents idle auto-suspend) or an external port-knock keepalive for a sandbox.',
+    description: 'Manage the official Instabox activity lease (prevents idle auto-suspend) or an external port-knock keepalive for a sandbox. Optional auto_wake wakes the sandbox after a max-run cooldown ends.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -189,6 +189,7 @@ const TOOLS = [
         mode: { type: 'string', enum: ['lease', 'knock', 'both'], description: 'Keepalive mode; default lease.' },
         ttl_seconds: { type: 'integer', minimum: 60, maximum: 3600, description: 'Lease TTL in seconds; default 900.' },
         knock_url: { type: 'string', description: 'Published port URL to poll for knock mode.' },
+        auto_wake: { type: 'boolean', description: 'After a max-run cooldown ends, wake (wake → resume → start) before renewing the lease. Default false.' },
       },
       required: ['operation'],
       additionalProperties: false,
@@ -493,9 +494,12 @@ async function keepaliveTool(args) {
     if (!state.keepalive.length) return ok('没有启用中的 keepalive。');
     const rows = state.keepalive.map((k) => {
       const left = k.expiresAt ? Math.max(0, Math.round((new Date(k.expiresAt).getTime() - Date.now()) / 60000)) : null;
-      return `| ${k.account} | ${k.machineId} | ${k.machineName || ''} | ${k.mode || 'lease'} | ${k.ttlSeconds || 900}s | ${left === null ? '待创建' : `${left} 分钟`} | ${k.lastOk === false ? `⚠ ${k.lastError || '失败'}` : 'ok'} |`;
+      const wake = k.autoWake
+        ? (k.lastWakeAction ? `${k.lastWakeAction} ${String(k.lastWakeAt || '').slice(11, 16)}` : '待命')
+        : '—';
+      return `| ${k.account} | ${k.machineId} | ${k.machineName || ''} | ${k.mode || 'lease'} | ${k.ttlSeconds || 900}s | ${left === null ? '待创建' : `${left} 分钟`} | ${wake} | ${k.lastOk === false ? `⚠ ${k.lastError || '失败'}` : 'ok'} |`;
     });
-    return ok(['| 账号 | 机器 | 名称 | 模式 | TTL | 租约剩余 | 状态 |', '| --- | --- | --- | --- | --- | --- | --- |', ...rows].join('\n'));
+    return ok(['| 账号 | 机器 | 名称 | 模式 | TTL | 租约剩余 | 冷却唤醒 | 状态 |', '| --- | --- | --- | --- | --- | --- | --- | --- |', ...rows].join('\n'));
   }
 
   if (!args.machine_id) return fail('需要 machine_id。');
@@ -519,13 +523,14 @@ async function keepaliveTool(args) {
       mode: args.mode,
       ttlSeconds: args.ttl_seconds,
       knockUrl: args.knock_url,
+      autoWake: args.auto_wake,
       enabled: true,
     });
     store.save(state);
     const patches = await keepalive.tick();
     const patch = patches.find((p) => p.entry.account === account.alias && p.entry.machineId === machineId);
     const fresh = store.load().keepalive.find((k) => k.account === account.alias && k.machineId === machineId);
-    const stateText = fresh ? `${fresh.mode} · ${fresh.ttlSeconds}s${fresh.expiresAt ? ` · 租约至 ${fresh.expiresAt}` : ''}` : '已写入';
+    const stateText = fresh ? `${fresh.mode} · ${fresh.ttlSeconds}s${fresh.expiresAt ? ` · 租约至 ${fresh.expiresAt}` : ''}${fresh.autoWake ? ' · 冷却自动唤醒' : ''}` : '已写入';
     const errorText = patch && patch.patch.lastError ? `\n\n⚠ ${patch.patch.lastError}` : '';
     return ok(`keepalive 已开启：${machineId}\n\n${stateText}${errorText}`);
   }

@@ -619,6 +619,17 @@ button:disabled {
   font-size: 10px;
   color: var(--text);
 }
+.ka-auto {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ka-auto:hover { color: var(--text); }
+.ka-auto input { margin: 0; accent-color: var(--green); }
 
 .switch {
   position: relative;

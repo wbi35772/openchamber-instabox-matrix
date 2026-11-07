@@ -6,7 +6,7 @@ OpenChamber 扩展：在一个面板里管理多个 Instabox 账号的沙盒机�
 
 - **多账号矩阵**：每个账号一行，机器卡片显示状态、规格、数据盘、连续运行时长（uptime）与 IP。
 - **机器操作**：启动、停止、暂停、恢复、重启、删除（需输入名称确认），以及创建与克隆（模板、等待 operation）。
-- **活动租约**：自动为运行中的机器续租，空闲暂停后由 exec / 终端流量唤醒。
+- **活动租约**：自动为运行中的机器续租，空闲暂停后由 exec / 终端流量唤醒；可选「冷却唤醒」，最长运行冷却结束后自动 wake → resume → start 再续租。
 - **命令执行**：同步 `exec`，长命令自动转异步 job（30 秒阈值），8 MB 响应上限。
 - **文件管理**：列目录、读写文本、预览、≤5 MiB 直接下载，大文件走上传/下载链接。
 - **快照与端口**：创建/恢复/删除快照，列出与开放公网端口。
@@ -68,7 +68,7 @@ MCP 服务直接读取状态文件并访问 Instabox API，不依赖面板或本
 | `instabox_exec_command` | 同步或异步执行命令 |
 | `instabox_manage_snapshot` | list / create / restore / delete |
 | `instabox_expose_port` | list / expose / unexpose |
-| `instabox_keepalive` | status / set / clear |
+| `instabox_keepalive` | status / set / clear（set 支持 `auto_wake`） |
 | `instabox_network_info` | 探测运行时 IP |
 | `instabox_inspect` | metrics / logs / history / processes |
 | `instabox_create_machine` | 从模板创建机器 |
@@ -89,6 +89,7 @@ MCP 服务直接读取状态文件并访问 Instabox API，不依赖面板或本
 - 公网 IP 只在机器运行时可见。
 - 连续运行时间取自 `runStartedAt`（缺失时用 `readyAt`），机器暂停/停止后显示 `—`。
 - 活动租约只能阻止空闲自动暂停，不能延长最长连续运行时间；到点后机器进入冷却，租约返回 409 并保留退避时间。
+- 冷却唤醒默认关闭。开启后只在退避到点（retryAt）时尝试 wake → resume → start，成功后继续续租；免费计划连续触发冷却的等待会递增（5–20 分钟，之后 60–75 / 120–135 分钟）。
 - SSH Token 最长 2,592,000 秒；`noExpiry` 与 `ttlSeconds` 互斥。
 - 桌面链接默认只读，有到期时间；没有桌面 `stop` 动作，撤销链接或停止机器即可。
 - 终端为轮询实现，单用户单会话，空闲 2 分钟回收；立即重连（<1 秒）可能拿到空回放。
