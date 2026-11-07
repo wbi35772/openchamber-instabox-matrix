@@ -5,9 +5,10 @@ const store = require('../lib/store');
 const { InstaboxClient, InstaboxError } = require('../lib/instabox');
 const { createKeepalive } = require('../lib/keepalive');
 const { createNetProbe } = require('../lib/netprobe');
+const { machineUptime } = require('../lib/uptime');
 
 const SERVER_NAME = 'instabox-matrix';
-const SERVER_VERSION = '1.1.0';
+const SERVER_VERSION = '1.2.0';
 
 function log(message) {
   try { process.stderr.write(`[instabox-matrix-mcp] ${message}\n`); } catch { /* ignore */ }
@@ -77,6 +78,21 @@ function resolveAccount(state, alias) {
 
 function client(account, state) {
   return InstaboxClient.fromAccount(account, state.settings);
+}
+
+async function resolveMachineId(api, value) {
+  const ref = String(value || '').trim();
+  if (!ref) return ref;
+  try {
+    const machine = await api.getMachine(ref);
+    if (machine && machine.id) return machine.id;
+  } catch (error) {
+    if (!error || error.status !== 404) throw error;
+  }
+  const machines = await api.listMachines();
+  const match = machines.find((m) => m.name === ref || m.id === ref);
+  if (!match) throw new InstaboxError(`找不到机器：${ref}`, { code: 'machine_not_found', status: 404 });
+  return match.id;
 }
 
 const netprobe = createNetProbe();
@@ -340,13 +356,14 @@ async function listMachines(args) {
         const kaText = ka
           ? `${ka.mode || 'lease'}${ka.expiresAt ? ` → ${new Date(ka.expiresAt).toISOString().slice(11, 16)}Z` : ''}${ka.lastOk === false ? ' ⚠' : ''}`
           : '—';
-        return `| ${m.id} | ${m.name || ''} | ${stateLabel(m)} | ${machineSpec(m)} | ${m.template ? `${m.template.id} ${m.template.version}` : '—'} | ${m.autoSuspendAfterSeconds === null ? 'off' : `${m.autoSuspendAfterSeconds}s`} | ${kaText} |`;
+        const uptime = machineUptime(m);
+        return `| ${m.id} | ${m.name || ''} | ${stateLabel(m)} | ${uptime ? uptime.text : '—'} | ${machineSpec(m)} | ${m.template ? `${m.template.id} ${m.template.version}` : '—'} | ${m.autoSuspendAfterSeconds === null ? 'off' : `${m.autoSuspendAfterSeconds}s`} | ${kaText} |`;
       });
       blocks.push([
         header,
         '',
-        '| ID | 名称 | 状态 | 规格 | 模板 | 空闲暂停 | Keepalive |',
-        '| --- | --- | --- | --- | --- | --- | --- |',
+        '| ID | 名称 | 状态 | 连续运行 | 规格 | 模板 | 空闲暂停 | Keepalive |',
+        '| --- | --- | --- | --- | --- | --- | --- | --- |',
         ...rows,
       ].join('\n'));
     } catch (error) {
@@ -483,19 +500,21 @@ async function keepaliveTool(args) {
 
   if (!args.machine_id) return fail('需要 machine_id。');
   const account = resolveAccount(state, args.account);
+  const api = client(account, state);
+  const machineId = await resolveMachineId(api, args.machine_id);
   const keepalive = createKeepalive({});
 
   if (operation === 'clear') {
-    await keepalive.release(account.alias, args.machine_id).catch(() => {});
-    store.upsertKeepalive(state, { account: account.alias, machineId: args.machine_id, enabled: false });
+    await keepalive.release(account.alias, machineId).catch(() => {});
+    store.upsertKeepalive(state, { account: account.alias, machineId, enabled: false });
     store.save(state);
-    return ok(`已关闭 keepalive：${args.machine_id}`);
+    return ok(`已关闭 keepalive：${machineId}`);
   }
 
   if (operation === 'set') {
     store.upsertKeepalive(state, {
       account: account.alias,
-      machineId: args.machine_id,
+      machineId,
       machineName: args.machine_name || '',
       mode: args.mode,
       ttlSeconds: args.ttl_seconds,
@@ -504,11 +523,11 @@ async function keepaliveTool(args) {
     });
     store.save(state);
     const patches = await keepalive.tick();
-    const patch = patches.find((p) => p.entry.account === account.alias && p.entry.machineId === args.machine_id);
-    const fresh = store.load().keepalive.find((k) => k.account === account.alias && k.machineId === args.machine_id);
+    const patch = patches.find((p) => p.entry.account === account.alias && p.entry.machineId === machineId);
+    const fresh = store.load().keepalive.find((k) => k.account === account.alias && k.machineId === machineId);
     const stateText = fresh ? `${fresh.mode} · ${fresh.ttlSeconds}s${fresh.expiresAt ? ` · 租约至 ${fresh.expiresAt}` : ''}` : '已写入';
     const errorText = patch && patch.patch.lastError ? `\n\n⚠ ${patch.patch.lastError}` : '';
-    return ok(`keepalive 已开启：${args.machine_id}\n\n${stateText}${errorText}`);
+    return ok(`keepalive 已开启：${machineId}\n\n${stateText}${errorText}`);
   }
 
   return fail(`未知 operation：${operation}`);

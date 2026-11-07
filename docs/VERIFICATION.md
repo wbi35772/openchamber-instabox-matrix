@@ -1,4 +1,4 @@
-# Instabox Matrix 1.1.0 验收清单
+# Instabox Matrix 1.2.0 验收清单
 
 一次完整验收的做法：本机 Windows + OpenChamber，扩展服务由宿主启动（也可用 `node service/main.js` 加 `OPENCHAMBER_SERVICE_PORT` / `OPENCHAMBER_SERVICE_TOKEN` 手工启动）。所有 API 调用都经账号自己的 API Key 发往 Instabox Gateway，面板从不接触 Key。
 
@@ -102,7 +102,16 @@
 | `instabox_ssh_token` | `list` 返回 Token 数组 |
 | `instabox_desktop` | `status` 返回桌面状态 |
 
-## 12. 面板完整性
+## 12. 连续运行时间（已实测 2026-11-07）
+
+1. 运行中的机器卡片右上出现 `UP x小时y分` 徽标，规格区显示「连续运行」。
+2. 详情「概览」显示「连续运行」与「本次启动」。
+3. `instabox_list_machines` 的表格含「连续运行」列。
+4. 暂停/停止机器后 `runStartedAt` 变为 `null`，面板显示 `—`，不会把上次运行时长当成当前值。
+5. 实测：`test` 从 `2026-11-07T10:56:46Z` 连续运行到 `15:56:48Z`（5 小时，到达 `maxRunMinutes=300`），随后 `autoSuspendedAt=15:56:48Z`、`runStartedAt=null`、`cooldownUntil=18:05:49Z`。
+6. 同一时间窗内活动租约成功续租 87 次，空闲暂停阈值 1800 秒没有触发；租约失败只出现在机器进入冷却之后（`machine is cooling down until ...`），说明租约能防空闲暂停，不能延长最长运行时间。
+
+## 13. 面板完整性
 
 详情 tab 依次为：概览、访问、文件、终端、指标、日志、历史、进程。切换 tab 会停止上一个轮询（终端会 DELETE 会话，桌面链接轮询停止），关闭弹窗不留下定时器。
 

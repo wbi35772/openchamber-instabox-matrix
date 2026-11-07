@@ -252,6 +252,30 @@
     return Math.round(diff / 86400000) + ' 天前';
   }
 
+  function fmtUptime(ms) {
+    var total = Math.floor(Number(ms) / 1000);
+    if (!Number.isFinite(total) || total < 0) return '—';
+    if (total < 60) return total + '秒';
+    var minutes = Math.floor(total / 60);
+    if (minutes < 60) return total % 60 ? minutes + '分' + (total % 60) + '秒' : minutes + '分';
+    var hours = Math.floor(minutes / 60);
+    var restMinutes = minutes % 60;
+    if (hours < 24) return restMinutes ? hours + '小时' + restMinutes + '分' : hours + '小时';
+    var days = Math.floor(hours / 24);
+    var restHours = hours % 24;
+    return restHours ? days + '天' + restHours + '小时' : days + '天';
+  }
+
+  function uptimeOf(machine) {
+    if (!machine) return null;
+    if (machine.state !== 'running' && machine.state !== 'starting' && machine.state !== 'suspending') return null;
+    var startedAt = machine.runStartedAt || machine.readyAt;
+    if (!startedAt) return null;
+    var then = new Date(startedAt).getTime();
+    if (!Number.isFinite(then)) return null;
+    return { startedAt: startedAt, ms: Math.max(0, Date.now() - then) };
+  }
+
   function clockNow() {
     var d = new Date();
     function pad(n) { return n < 10 ? '0' + n : String(n); }
@@ -678,6 +702,8 @@
     var badges = ['<span class="badge ' + tone + '">' + esc(stateLabel(machine)) + '</span>'];
     if (machine.free) badges.push('<span class="badge free">免费</span>');
     if (machine.operationId) badges.push('<span class="badge busy">op ' + esc(String(machine.operationId).slice(0, 10)) + '</span>');
+    var uptime = uptimeOf(machine);
+    if (uptime) badges.push('<span class="badge uptime" title="本次连续运行开始于 ' + esc(fmtDate(uptime.startedAt)) + '">UP ' + esc(fmtUptime(uptime.ms)) + '</span>');
     if (machine.account) badges.push('<span class="account-tag" title="账号">' + esc(machine.account) + '</span>');
 
     var connection = machine.connection;
@@ -759,6 +785,7 @@
       metaItem('数据盘', diskText(machine)),
       metaItem('空闲暂停', fmtDuration(machine.autoSuspendAfterSeconds), machine.autoSuspendAfterSeconds ? 'warn' : ''),
       metaItem('最长运行', fmtMinutes(machine.maxRunMinutes)),
+      metaItem('连续运行', uptime ? fmtUptime(uptime.ms) : '—', uptime ? 'ok' : ''),
       metaItem('快照序号', machine.storage && machine.storage.snapshotSeq != null ? '#' + machine.storage.snapshotSeq : '—'),
       '</div>',
 
@@ -1362,6 +1389,7 @@
   }
 
   function detailOverview(machine) {
+    var uptimeDetail = uptimeOf(machine);
     var rows = [
       metaItem('状态', stateLabel(machine)),
       metaItem('账号', machine.account),
@@ -1370,6 +1398,8 @@
       metaItem('数据盘', diskText(machine)),
       metaItem('空闲暂停', fmtDuration(machine.autoSuspendAfterSeconds)),
       metaItem('最长运行', fmtMinutes(machine.maxRunMinutes)),
+      metaItem('连续运行', uptimeDetail ? fmtUptime(uptimeDetail.ms) : '—', uptimeDetail ? 'ok' : ''),
+      metaItem('本次启动', uptimeDetail ? fmtDate(uptimeDetail.startedAt) : '—'),
       metaItem('创建时间', fmtDate(machine.createdAt)),
     ];
     var connection = machine.connection;
