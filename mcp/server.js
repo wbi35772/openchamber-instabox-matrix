@@ -5,6 +5,7 @@ const store = require('../lib/store');
 const { InstaboxClient, InstaboxError } = require('../lib/instabox');
 const { createKeepalive } = require('../lib/keepalive');
 const { createNetProbe } = require('../lib/netprobe');
+const inventory = require('../lib/inventory');
 const { machineUptime } = require('../lib/uptime');
 
 const SERVER_NAME = 'instabox-matrix';
@@ -137,6 +138,21 @@ const TOOLS = [
         account: { type: 'string', description: 'Account alias; omit for the active account.' },
       },
       required: ['machine_id', 'command'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'instabox_inventory',
+    description: 'Scan a running Instabox sandbox for listening ports, containers, systemd services and deployed apps with URLs and login details from /etc/instabox-apps.json. action=scaffold writes the manifest template.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        machine_id: { type: 'string', description: 'Sandbox ID (m_...) or exact sandbox name.' },
+        action: { type: 'string', enum: ['scan', 'scaffold'], description: 'scan (default) or write the app manifest template.' },
+        timeout_seconds: { type: 'integer', minimum: 15, maximum: 180, description: 'Scan timeout; default 90.' },
+        account: { type: 'string', description: 'Account alias; omit for the active account.' },
+      },
+      required: ['machine_id'],
       additionalProperties: false,
     },
   },
@@ -406,6 +422,31 @@ async function execCommand(args) {
   ];
   if (result.stderr) lines.push('', '**stderr**', '```', result.stderr, '```');
   return ok(lines.join('\n'));
+}
+
+async function inventoryTool(args) {
+  const state = store.load();
+  const account = resolveAccount(state, args.account);
+  const api = client(account, state);
+  const machineId = String(args.machine_id || '');
+  if (!machineId) return fail('需要 machine_id。');
+
+  if (args.action === 'scaffold') {
+    const body = JSON.stringify(inventory.MANIFEST_EXAMPLE, null, 2);
+    const cmd = `mkdir -p /etc && cat > /etc/instabox-apps.json <<'JSONEOF'\n${body}\nJSONEOF\nwc -c /etc/instabox-apps.json`;
+    const result = await api.exec(machineId, cmd, { timeoutSeconds: 30, noHistory: true });
+    if (result.exitCode !== 0) return fail(`写入应用清单失败：${result.stderr || result.stdout}`);
+    return ok(`已写入应用清单模板：/etc/instabox-apps.json\n\n编辑后重新扫描（action=scan）。\n\n\`\`\`json\n${body}\n\`\`\``);
+  }
+
+  const machine = await api.getMachine(machineId).catch(() => null);
+  if (machine && machine.state && machine.state !== 'running') {
+    return fail(`机器未运行（${machine.state}），启动后才能扫描服务清单。`);
+  }
+  const scanned = await inventory.scanInventory(api, machineId, {
+    timeoutSeconds: Number(args.timeout_seconds) || 90,
+  });
+  return ok(inventory.inventoryMarkdown(scanned, args.machine_id));
 }
 
 async function manageSnapshot(args) {
@@ -895,6 +936,7 @@ async function callTool(name, args) {
     case 'instabox_list_machines': return listMachines(args);
     case 'instabox_power_action': return powerAction(args);
     case 'instabox_exec_command': return execCommand(args);
+    case 'instabox_inventory': return inventoryTool(args);
     case 'instabox_manage_snapshot': return manageSnapshot(args);
     case 'instabox_expose_port': return exposePort(args);
     case 'instabox_keepalive': return keepaliveTool(args);

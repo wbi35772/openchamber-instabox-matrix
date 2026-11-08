@@ -1377,7 +1377,7 @@
     stopTerminal();
     var machine = spec.machine;
     var tab = spec.tab || 'overview';
-    var tabs = [['overview', '概览'], ['terminal', '终端'], ['access', '访问'], ['files', '文件'], ['metrics', '指标'], ['logs', '日志'], ['history', '历史'], ['processes', '进程']];
+    var tabs = [['overview', '概览'], ['services', '服务'], ['terminal', '终端'], ['access', '访问'], ['files', '文件'], ['metrics', '指标'], ['logs', '日志'], ['history', '历史'], ['processes', '进程']];
     var body = [
       '<div class="status-line"><span class="grow">' + esc(machine.name || machine.id) + ' · ' + esc(machine.account) + '</span><span class="badge ' + stateTone(machine) + '">' + esc(stateLabel(machine)) + '</span></div>',
       '<div class="detail-tabs">' + tabs.map(function (entry) {
@@ -1425,6 +1425,170 @@
       '<div class="hint">机器 ID <code>' + esc(machine.id) + '</code></div>',
       '<div class="hint">指标、日志、历史与进程都来自 Instabox API；机器停止时日志和历史仍可读。</div>',
     ].join('');
+  }
+
+  var MANIFEST_EXAMPLE = JSON.stringify({
+    apps: [{ name: '示例应用', url: 'https://example.com', username: 'admin', password: 'change-me', notes: '控制台' }],
+  }, null, 2);
+
+  function inventoryEmpty(machine) {
+    var parts = [];
+    if (machine.state === 'running') {
+      parts.push('<button class="primary-btn" data-act="scan-inventory">' + icon('refresh') + '扫描服务</button>');
+    }
+    parts.push('<div class="hint">扫描会统计监听端口、容器、systemd 服务，并读取机器内的应用清单。</div>');
+    parts.push('<div class="hint">应用清单路径：<code>/etc/instabox-apps.json</code>、<code>/srv/instabox-apps.json</code>、<code>/data/instabox-apps.json</code> 或 <code>~/.instabox-apps.json</code>。</div>');
+    parts.push('<div class="hint">清单格式示例 <button class="small-btn" data-act="copy" data-copy="' + esc(MANIFEST_EXAMPLE) + '">复制</button></div>');
+    parts.push('<pre class="code-block">' + esc(MANIFEST_EXAMPLE) + '</pre>');
+    return parts.join('');
+  }
+
+  function inventoryStatCard(label, value) {
+    return [
+      '<div class="metric-card">',
+      '<div class="metric-label">' + esc(label) + '</div>',
+      '<div class="metric-value" title="' + esc(value) + '">' + esc(value) + '</div>',
+      '</div>',
+    ].join('');
+  }
+
+  function inventoryBody(inv, machine) {
+    if (!inv) return inventoryEmpty(machine);
+    var host = inv.host || {};
+    var apps = inv.apps || [];
+    var publicPorts = inv.publicPorts || [];
+    var ports = inv.listeningPorts || [];
+    var containers = inv.containers || [];
+    var services = inv.services || [];
+    var load = (host.loadAverage || []).join(' / ') || '—';
+    var disk = host.disk && host.disk.totalBytes
+      ? fmtBytes(host.disk.usedBytes) + ' / ' + fmtBytes(host.disk.totalBytes) + ' (' + Number(host.disk.usedPct || 0).toFixed(1) + '%)'
+      : '—';
+    var memory = host.memoryTotalBytes
+      ? fmtBytes(host.memoryTotalBytes - (host.memoryAvailableBytes || 0)) + ' / ' + fmtBytes(host.memoryTotalBytes)
+      : '—';
+    var parts = [];
+    parts.push('<div class="status-line"><span class="grow">扫描于 ' + esc(fmtDate(inv.scannedAt)) + (inv.scanDurationMs ? ' · 用时 ' + Math.max(1, Math.round(inv.scanDurationMs / 1000)) + ' 秒' : '') + '</span><button class="ghost-btn" data-act="scan-inventory">' + icon('refresh') + '重新扫描</button></div>');
+    parts.push('<div class="metric-grid">'
+      + inventoryStatCard('已部署应用', String(apps.length))
+      + inventoryStatCard('公网入口', String(publicPorts.length))
+      + inventoryStatCard('监听端口', String(ports.length))
+      + inventoryStatCard('容器', String(containers.length))
+      + inventoryStatCard('systemd 服务', String(services.length))
+      + '</div>');
+    parts.push('<div class="meta-grid">' + [
+      metaItem('主机', host.hostname || '—'),
+      metaItem('系统', (host.os || '—') + (host.arch ? ' · ' + host.arch : '')),
+      metaItem('内核', host.kernel || '—'),
+      metaItem('CPU', (host.cpuCount || '—') + ' vCPU · 负载 ' + load),
+      metaItem('内存', memory),
+      metaItem('磁盘', disk),
+      metaItem('连续运行', host.uptimeSeconds != null ? fmtDuration(host.uptimeSeconds) : '—'),
+      metaItem('软件包', inv.packageCount ? String(inv.packageCount) : '—'),
+    ].join('') + '</div>');
+
+    parts.push('<div class="divider"></div>');
+    parts.push('<div class="hint">已部署应用' + (inv.manifestPath ? ' · 清单 <code>' + esc(inv.manifestPath) + '</code>' : ' · 未找到应用清单') + '</div>');
+    if (apps.length) {
+      parts.push('<div class="table-wrap"><table class="detail-table"><thead><tr><th>名称</th><th>跳转地址</th><th>用户名</th><th>密码</th><th>备注</th></tr></thead><tbody>');
+      apps.forEach(function (app, index) {
+        var link = app.url
+          ? '<a href="#" data-act="open-url" data-url="' + esc(app.url) + '">' + esc(app.url) + '</a> <button class="small-btn" data-act="copy" data-copy="' + esc(app.url) + '" title="复制地址">' + icon('copy') + '</button>'
+          : '—';
+        var user = app.username
+          ? esc(app.username) + ' <button class="small-btn" data-act="copy" data-copy="' + esc(app.username) + '" title="复制用户名">' + icon('copy') + '</button>'
+          : '—';
+        var password = app.password
+          ? '<span class="mono" id="app-pass-' + index + '" data-pass="' + esc(app.password) + '" data-masked="1">••••••</span> <button class="small-btn" data-act="reveal-pass" data-target="app-pass-' + index + '">显示</button> <button class="small-btn" data-act="copy" data-copy="' + esc(app.password) + '" title="复制密码">' + icon('copy') + '</button>'
+          : '—';
+        parts.push('<tr><td>' + esc(app.name) + '</td><td class="mono">' + link + '</td><td class="mono">' + user + '</td><td>' + password + '</td><td class="sub">' + esc(app.notes || '—') + '</td></tr>');
+      });
+      parts.push('</tbody></table></div>');
+    } else {
+      parts.push('<div class="hint">还没有应用清单。在机器里写入 <code>/etc/instabox-apps.json</code> 并重新扫描，就能在这里看到跳转地址与登录信息。</div>');
+    }
+
+    if (publicPorts.length) {
+      parts.push('<div class="divider"></div>');
+      parts.push('<div class="hint">公网入口</div>');
+      parts.push('<div class="table-wrap"><table class="detail-table"><thead><tr><th>名称</th><th>端口</th><th>协议</th><th>地址</th></tr></thead><tbody>');
+      publicPorts.forEach(function (entry) {
+        var url = entry.url || entry.tokenUrl || '';
+        var cell = url
+          ? '<a href="#" data-act="open-url" data-url="' + esc(url) + '">' + esc(url) + '</a> <button class="small-btn" data-act="copy" data-copy="' + esc(url) + '" title="复制地址">' + icon('copy') + '</button>'
+          : '—';
+        parts.push('<tr><td>' + esc(entry.name || '—') + '</td><td class="num">' + esc(entry.port) + '</td><td>' + esc(entry.protocol || 'http') + '</td><td class="mono">' + cell + '</td></tr>');
+      });
+      parts.push('</tbody></table></div>');
+    }
+
+    if (containers.length) {
+      parts.push('<div class="divider"></div>');
+      parts.push('<div class="hint">容器</div>');
+      parts.push('<div class="table-wrap"><table class="detail-table"><thead><tr><th>名称</th><th>镜像</th><th>状态</th><th>端口</th><th>项目</th></tr></thead><tbody>');
+      containers.forEach(function (container) {
+        var mapping = (container.ports || []).map(function (item) {
+          return item.hostPort ? item.hostPort + '→' + item.containerPort + '/' + (item.protocol || 'tcp') : item.containerPort + '/' + (item.protocol || 'tcp');
+        }).join(', ') || '—';
+        var stateText = [container.state, container.status].filter(Boolean).join(' · ') || '—';
+        parts.push('<tr><td class="mono">' + esc(container.name || container.id) + '</td><td class="mono">' + esc(container.image || '—') + '</td><td>' + esc(stateText) + '</td><td class="mono">' + esc(mapping) + '</td><td>' + esc(container.project || '—') + '</td></tr>');
+      });
+      parts.push('</tbody></table></div>');
+    }
+
+    if (ports.length) {
+      parts.push('<div class="divider"></div>');
+      parts.push('<div class="hint">监听端口</div>');
+      parts.push('<div class="table-wrap"><table class="detail-table"><thead><tr><th>协议</th><th>地址</th><th>端口</th><th>进程</th><th>PID</th></tr></thead><tbody>');
+      ports.forEach(function (entry) {
+        parts.push('<tr><td>' + esc(entry.protocol || 'tcp') + '</td><td class="mono">' + esc(entry.address || '*') + '</td><td class="num">' + esc(entry.port) + '</td><td class="mono">' + esc(entry.process || '—') + '</td><td class="num">' + esc(entry.pid || '—') + '</td></tr>');
+      });
+      parts.push('</tbody></table></div>');
+    }
+
+    if (services.length) {
+      parts.push('<div class="divider"></div>');
+      parts.push('<div class="hint">systemd 服务</div>');
+      parts.push('<div class="table-wrap"><table class="detail-table"><thead><tr><th>单元</th><th>状态</th><th>说明</th></tr></thead><tbody>');
+      services.forEach(function (entry) {
+        parts.push('<tr><td class="mono">' + esc(entry.unit) + '</td><td>' + esc([entry.active, entry.sub].filter(Boolean).join(' · ') || '—') + '</td><td class="sub">' + esc(entry.description || '—') + '</td></tr>');
+      });
+      parts.push('</tbody></table></div>');
+    }
+
+    if (inv.warnings && inv.warnings.length) {
+      parts.push('<div class="divider"></div>');
+      parts.push('<div class="hint">扫描提示</div>');
+      inv.warnings.forEach(function (warning) {
+        parts.push('<div class="status-line bad">' + esc(warning) + '</div>');
+      });
+    }
+    return parts.join('');
+  }
+
+  async function scanInventoryAction(button) {
+    if (!state.modal || state.modal.kind !== 'detail') return;
+    var machine = state.modal.machine;
+    await withButton(button, async function () {
+      var pack = await service('POST', detailBase(machine) + '/inventory', {
+        body: { force: true },
+        timeoutMs: 150000,
+      });
+      if (!detailOpen(machine, 'services')) return;
+      var body = $('#detail-body');
+      if (body) body.innerHTML = inventoryBody(pack.inventory, machine);
+      toast('服务清单已更新', 'ok');
+    });
+  }
+
+  function revealPass(button) {
+    var id = button.dataset.target;
+    var node = id ? document.getElementById(id) : null;
+    if (!node) return;
+    var masked = node.dataset.masked !== '0';
+    node.textContent = masked ? (node.dataset.pass || '') : '••••••';
+    node.dataset.masked = masked ? '0' : '1';
+    button.textContent = masked ? '隐藏' : '显示';
   }
 
   function sparkline(values, max) {
@@ -1984,7 +2148,7 @@
     }
   }
 
-  async function loadDetailTab(machine, tab) {
+  async function loadDetailTab(machine, tab, force) {
     var body = $('#detail-body');
     if (!body) return;
     if (tab === 'overview') {
@@ -2013,6 +2177,31 @@
       } catch (error) {
         if (!detailOpen(machine, 'access')) return;
         body.innerHTML = '<div class="status-line bad">' + esc(describeError(error)) + '</div>';
+      }
+      return;
+    }
+    if (tab === 'services') {
+      body.innerHTML = loadingRow('扫描服务清单…');
+      try {
+        var pack = await service('GET', detailBase(machine) + '/inventory', { timeoutMs: 30000 });
+        var inv = pack && pack.inventory;
+        var blocked = null;
+        if (!inv) {
+          if (machine.state === 'running') {
+            var scanned = await service('POST', detailBase(machine) + '/inventory', {
+              body: { force: Boolean(force) },
+              timeoutMs: 150000,
+            });
+            inv = (scanned && scanned.inventory) || null;
+          } else {
+            blocked = '机器未运行，启动后才能扫描服务清单。';
+          }
+        }
+        if (!detailOpen(machine, 'services')) return;
+        body.innerHTML = (blocked ? '<div class="status-line">' + esc(blocked) + '</div>' : '') + (inv ? inventoryBody(inv, machine) : inventoryEmpty(machine));
+      } catch (error) {
+        if (!detailOpen(machine, 'services')) return;
+        body.innerHTML = '<div class="status-line bad">' + esc(describeError(error)) + '</div>' + inventoryEmpty(machine);
       }
       return;
     }
@@ -2656,7 +2845,7 @@
         if (!state.modal || state.modal.kind !== 'detail') return;
         clearDetailTimer();
         stopTerminal();
-        void loadDetailTab(state.modal.machine, state.modal.tab || 'overview');
+        void loadDetailTab(state.modal.machine, state.modal.tab || 'overview', true);
         return;
       }
       if (act === 'history-entry') { loadHistoryEntry(el); return; }
@@ -2701,6 +2890,8 @@
       if (act === 'restore-snapshot') { restoreSnapshot(el); return; }
       if (act === 'publish-port') { publishPort(el); return; }
       if (act === 'refresh-ports') { loadPorts(el.dataset.machine, el.dataset.account); return; }
+      if (act === 'scan-inventory') { scanInventoryAction(el); return; }
+      if (act === 'reveal-pass') { revealPass(el); return; }
       if (act === 'unpublish-port') { unpublishPort(el); return; }
       if (act === 'confirm-delete') { confirmDelete(el); return; }
     });

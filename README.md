@@ -13,7 +13,8 @@ OpenChamber 扩展：在一个面板里管理多个 Instabox 账号的沙盒机�
 - **SSH Token**：生成一次性登录命令（1 小时 / 24 小时 / 7 天 / 永久），列表与撤销。
 - **桌面**：安装/启动/接管/交还桌面，生成只读、可过期的浏览器链接并轮询状态。
 - **Web 终端**：详情里的 xterm 终端，250 ms 轮询、输入/缩放、持久 shell 重连回放。
-- **MCP 工具**：14 个工具，覆盖机器、执行、文件、快照、网络、SSH、桌面与终端之外的常用操作。
+- **服务清单**：详情「服务」tab 扫描机器内的监听端口、Docker 容器、systemd 服务，并读取 `/etc/instabox-apps.json` 展示已部署应用的可跳转地址、用户名、密码与备注；扫描结果缓存 5 分钟，密码默认隐藏，可复制或显示。
+- **MCP 工具**：15 个工具，覆盖机器、执行、服务清单、文件、快照、网络、SSH、桌面与终端之外的常用操作。
 - **本地服务代理**：面板只访问 `127.0.0.1` 上的服务，服务持有 Key 并直连 Instabox Gateway。
 
 ## 安装
@@ -66,6 +67,7 @@ MCP 服务直接读取状态文件并访问 Instabox API，不依赖面板或本
 | `instabox_list_machines` | 列出账号下的机器 |
 | `instabox_power_action` | status / start / stop / pause / resume / restart |
 | `instabox_exec_command` | 同步或异步执行命令 |
+| `instabox_inventory` | scan 服务清单 / scaffold 写入应用清单模板 |
 | `instabox_manage_snapshot` | list / create / restore / delete |
 | `instabox_expose_port` | list / expose / unexpose |
 | `instabox_keepalive` | status / set / clear（set 支持 `auto_wake`） |
@@ -80,7 +82,27 @@ MCP 服务直接读取状态文件并访问 Instabox API，不依赖面板或本
 
 ## 面板
 
-机器详情有 8 个 tab：概览、访问、文件、终端、指标、日志、历史、进程。切换或关闭会停止轮询并清理终端会话；关闭弹窗不会留下后台定时器。
+机器详情有 9 个 tab：概览、服务、访问、文件、终端、指标、日志、历史、进程。切换或关闭会停止轮询并清理终端会话；关闭弹窗不会留下后台定时器。服务 tab 首次打开会自动扫描一次，可用「重新扫描」强制刷新。
+
+### 应用清单
+
+服务 tab 读取机器内的应用清单文件，路径任选其一：`/etc/instabox-apps.json`、`/srv/instabox-apps.json`、`/data/instabox-apps.json`、`~/.instabox-apps.json`。格式：
+
+```json
+{
+  "apps": [
+    {
+      "name": "示例应用",
+      "url": "https://example.com",
+      "username": "admin",
+      "password": "change-me",
+      "notes": "控制台地址与登录信息"
+    }
+  ]
+}
+```
+
+也可让 Agent 调用 `instabox_inventory`（`action=scaffold`）写入模板。清单只在本机面板里展示，公网端口链接来自 Instabox 端口发布记录。
 
 ## 限制
 

@@ -7,6 +7,7 @@ const { InstaboxClient, InstaboxError } = require('../lib/instabox');
 const { createKeepalive } = require('../lib/keepalive');
 const { createJobs } = require('../lib/jobs');
 const { createNetProbe } = require('../lib/netprobe');
+const inventory = require('../lib/inventory');
 const { createTerminalManager } = require('../lib/terminal');
 
 const PORT = Number(process.env.OPENCHAMBER_SERVICE_PORT || 0);
@@ -29,6 +30,7 @@ const jobs = createJobs();
 const netprobe = createNetProbe();
 const terminals = createTerminalManager({ log });
 const portCache = new Map();
+const inventoryCache = new Map();
 
 function send(res, status, payload, extraHeaders = {}) {
   const body = payload === undefined ? '' : JSON.stringify(payload);
@@ -562,6 +564,40 @@ async function route(req, res, url) {
         ok: true,
         data: await client.processes(machineId, { all: query.all === 'true' || query.all === '1' }),
       });
+    }
+
+    if (rest[0] === 'inventory' && rest.length === 1) {
+      const key = `${alias}:${machineId}`;
+      const cached = inventoryCache.get(key) || null;
+      if (method === 'GET') {
+        return send(res, 200, { ok: true, inventory: cached, ttlMs: inventory.INVENTORY_TTL_MS });
+      }
+      if (method === 'POST') {
+        const body = await readBody(req);
+        const age = cached ? Date.now() - Date.parse(cached.scannedAt || 0) : Infinity;
+        if (!body.force && cached && age >= 0 && age < inventory.INVENTORY_TTL_MS) {
+          return send(res, 200, {
+            ok: true,
+            inventory: cached,
+            cached: true,
+            ttlMs: inventory.INVENTORY_TTL_MS,
+          });
+        }
+        const machine = await client.getMachine(machineId).catch(() => null);
+        if (machine && machine.state && machine.state !== 'running') {
+          throw new InstaboxError('机器未运行，启动后才能扫描服务清单', { code: 'machine_not_running', status: 409 });
+        }
+        const scanned = await inventory.scanInventory(client, machineId, {
+          timeoutSeconds: Math.max(15, Math.min(180, Number(body.timeoutSeconds) || 90)),
+        });
+        inventoryCache.set(key, scanned);
+        return send(res, 200, {
+          ok: true,
+          inventory: scanned,
+          cached: false,
+          ttlMs: inventory.INVENTORY_TTL_MS,
+        });
+      }
     }
 
     if (rest[0] === 'exec' && method === 'POST') {
