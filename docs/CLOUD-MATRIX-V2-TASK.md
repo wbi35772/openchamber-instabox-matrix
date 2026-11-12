@@ -337,7 +337,7 @@ const tlsSocket = tls.connect({
 - `sing-box 1.14.4 check`：vless + trojan 的 mixed 配置校验 exit 0。
 - 端到端端口映射：mixed `:24099` → socks5 outbound → 本地 SOCKS5 → HTTP 目标，`curl -x http://127.0.0.1:24099` 返回 `hello-through-singbox`。
 - 端到端 TLS：`createProxyFetch(24099).fetch('https://example.com/')` → HTTP 200，577 bytes（CONNECT + 显式 SNI 生效）。
-- 两条硬验收线（真实节点出口 IP / 停代理后零直连）本轮**未执行**：当前会话没有可用订阅与真实节点；命令见下。
+- 两条硬验收线（真实订阅，2026-11-12）：见下节；硬线 2 通过，硬线 1 因订阅出口轮换不成立。
 
 ```bash
 # 1) 用真实订阅起引擎（先放入 SUB_FILE）
@@ -355,5 +355,14 @@ curl -sS -x http://127.0.0.1:24001 https://api.ipify.org --max-time 5
 - `service/main.js`：`clientForAccount` 注入 `proxies.fetchFor(alias)`；`/api/settings` 接受 `proxy` 并 `closeAll()`；新增 `/api/proxy/status`、`/api/proxy/release`、`/api/proxy/probe`；shutdown 时 `closeAll()`。
 - `mcp/server.js`：MCP 工具走同一代理层，与面板服务共用端口。
 - 验证：146/146 单测通过；真实 service 冒烟（临时 dataDir + 假网关 + 假 HTTP 代理）→ `/api/overview` 200、网关命中 3 次、`/api/proxy/status` 端口一致。
-- 未执行：真实订阅节点出口 IP、停代理后零直连两条硬验收（当前无可用订阅）。
+- 停代理后零直连（硬线 2）：通过，见下节。
+
+## 真实订阅验收（2026-11-12）
+
+订阅：1203 节点（802 vless / 401 trojan），全部 ws+TLS，path `/?ed=2048`，Host/SNI 为同一 CDN 域名。
+
+- 修复：`lib/sub2port.js` 之前丢弃 `transport`；vless/trojan/vmess 现在输出 ws（path + Host）、grpc、http transport；新增回归测试，147/147 通过。
+- 硬线 2（零直连）通过：停掉 sing-box 后 `curl -x http://127.0.0.1:24001` 13ms 失败（exit 7）；`createProxyFetch` 首次 `PROXY_REQUEST_FAILED`、随后 `PROXY_QUARANTINED`，本地计数目标 0 次命中；同机直连仍为 `1.196.187.141`。
+- 硬线 1（出口 IP == 节点 IP）不成立：同一端口连续 3 次出口为 `185.17.122.89` / 证书错误 / `82.21.117.93`；24002 为 `37.220.82.145` → `167.99.246.140` → `46.249.99.199`。该订阅是轮换出口/中转，不是固定节点，不能用「等于节点 IP」判定。可复现结论：流量确实经代理（≠ 本机 `1.196.187.141`），但出口随机。
+- 要满足硬线 1，需要固定出口节点（直连 IP 的 vless/trojan，无 CDN/中转），用同样两条命令复测。
 

@@ -82,6 +82,18 @@ test('builds one mixed inbound per node with a 1:1 route', () => {
   assert.equal(built.config.route.final, 'block');
 });
 
+test('emits ws transport with path and Host header', () => {
+  const nodes = parseSubscription(
+    'vless://u1@1.1.1.1:443?type=ws&security=tls&sni=cdn.example&path=%2Fws%3Fed%3D2048&host=cdn.example#A',
+  );
+  const built = buildSingBoxConfig(nodes, { basePort: 24001 });
+  assert.deepEqual(built.config.outbounds[0].transport, {
+    type: 'ws',
+    path: '/ws?ed=2048',
+    headers: { Host: 'cdn.example' },
+  });
+});
+
 test('rejects more nodes than the configured pool size', () => {
   const nodes = [
     { tag: 'a', protocol: 'vless', server: '1.1.1.1', port: 443, auth: { uuid: 'u' }, tls: { enabled: false } },
