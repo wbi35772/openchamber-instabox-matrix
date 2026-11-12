@@ -395,3 +395,15 @@ curl -sS -x http://127.0.0.1:24001 https://api.ipify.org --max-time 5
 - 生产链路端到端：`store.load → createAccountProxy(enabled, ports[alias]=24001) → InstaboxClient.listMachines()` 返回 `machines=1`；sing-box 日志 `inbound/mixed[slot-24001] → outbound/vless[node-1] → api.instabox.sh:443`。
 - 硬线 2 **通过**：停 sing-box 后同一调用 71ms 失败（`proxy quarantined … ECONNREFUSED` → `network_error`）；同机直连 `https://api.instabox.sh/v1/machines` 仍返回 401（可达），证明没有回退直连。
 
+## P2 接线记录（2026-11-12）
+
+- 限流：`lib/ratelimit.js` 令牌桶 + `retryAt`；`InstaboxClient` 两条请求路径都走 `fetchWithLimit()`；HTTP 429 读 `retry-after`（头或 body）并 `noteRetryAfter`，抛出的 `InstaboxError.retryAfterSeconds` 可用。每账号配置 `settings.rateLimit = { rps, concurrency }`（默认 5 / 2）。
+- 错峰保活：`lib/keepalive.js` 每个 `account/machineId` 用稳定 `phaseOffset` 摊到 15s tick 内，`createScheduler({ concurrency: 4 })` 执行，同一 key 不重入；`clientFor` 可注入，保活请求与 MCP/服务共用各自账号的代理和限流。
+- 机器元数据：`state.machineMeta = [{ account, machineId, projectGroup, role, tags[], notes }]`；`setMachineMeta` 合并写、全空自动删；删账号时级联清理。
+- 新 MCP 工具：
+  - `matrix_tag`：`list` / `set` / `clear`，按 `account`（可 `all`）与 `machine_id` 读写分组、角色、标签、备注。
+  - `matrix_exec_batch`：按 `account=all` / `project_group` / `tags`（全匹配）/ `targets`（`alias:m_id`、`m_id`、机器名）筛选，`concurrency` 并发执行，返回逐台结果。
+  - `matrix_inventory_summary`：筛选后逐台跑栈探针，按 `projectGroup` 汇总机器数、存活、业务栈、磁盘/内存告警，附明细。
+- 验证：`node --test` 159/159 通过（新增 `tests/matrix-p2.test.js` 5 例）；`tools/list` 出现三个 `matrix_*` 工具；`matrix_tag list` 空态文案正确。
+- 现场限制：10:14 实测 `matrix_inventory_summary` 时机器 `proxygate` 处于 `suspended`，节点对 ws 返回 HTTP 409 → 我们的 `TLS upgrade failed: read ECONNRESET`；直连 API 确认 `state=suspended`，免费计划冷却至 `2026-11-12T18:58:53Z` 才能唤醒。属机器状态，不是代理层或代码缺陷。
+

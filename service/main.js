@@ -10,6 +10,8 @@ const { createNetProbe } = require('../lib/netprobe');
 const inventory = require('../lib/inventory');
 const { createTerminalManager } = require('../lib/terminal');
 const { createAccountProxy } = require('../lib/account-proxy');
+const { createRateLimiter } = require('../lib/ratelimit');
+const { createScheduler } = require('../lib/scheduler');
 
 const PORT = Number(process.env.OPENCHAMBER_SERVICE_PORT || 0);
 const TOKEN = String(process.env.OPENCHAMBER_SERVICE_TOKEN || '');
@@ -26,11 +28,16 @@ if (!PORT || !TOKEN) {
   process.exit(1);
 }
 
-const keepalive = createKeepalive({ log });
+const proxies = createAccountProxy({ getState: () => store.load(), log });
+const rateLimiter = createRateLimiter();
 const jobs = createJobs();
+const keepalive = createKeepalive({
+  log,
+  rateLimiter,
+  clientFor: (alias) => clientForAccount(store.findAccount(store.load(), alias), store.load()),
+});
 const netprobe = createNetProbe();
 const terminals = createTerminalManager({ log });
-const proxies = createAccountProxy({ getState: () => store.load(), log });
 const portCache = new Map();
 const inventoryCache = new Map();
 
@@ -108,8 +115,13 @@ function selectedAccounts(state, requested) {
 }
 
 function clientForAccount(account, state) {
+  if (!account) return InstaboxClient.fromAccount(account, state.settings, {});
+  const limit = store.normalizeRateLimit(state.settings && state.settings.rateLimit);
+  rateLimiter.configure(account.alias, limit);
   return InstaboxClient.fromAccount(account, state.settings, {
     fetchImpl: proxies.fetchFor(account.alias),
+    rateLimiter,
+    rateKey: account.alias,
   });
 }
 

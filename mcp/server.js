@@ -6,7 +6,10 @@ const { InstaboxClient, InstaboxError } = require('../lib/instabox');
 const { createKeepalive } = require('../lib/keepalive');
 const { createNetProbe } = require('../lib/netprobe');
 const inventory = require('../lib/inventory');
+const inventoryProbe = require('../lib/inventory-probe');
 const { createAccountProxy } = require('../lib/account-proxy');
+const { createRateLimiter } = require('../lib/ratelimit');
+const { createScheduler } = require('../lib/scheduler');
 const { machineUptime } = require('../lib/uptime');
 
 const SERVER_NAME = 'instabox-matrix';
@@ -79,8 +82,14 @@ function resolveAccount(state, alias) {
 }
 
 function client(account, state) {
+  if (!account) {
+    throw new InstaboxError('还没有配置可用的 Instabox 账号', { code: 'account_not_found', status: 404 });
+  }
+  rateLimiter.configure(account.alias, store.normalizeRateLimit(state.settings && state.settings.rateLimit));
   return InstaboxClient.fromAccount(account, state.settings, {
     fetchImpl: proxies.fetchFor(account.alias),
+    rateLimiter,
+    rateKey: account.alias,
   });
 }
 
@@ -101,6 +110,7 @@ async function resolveMachineId(api, value) {
 
 const netprobe = createNetProbe();
 const proxies = createAccountProxy({ getState: () => store.load(), log });
+const rateLimiter = createRateLimiter();
 
 async function proxyTool(args) {
   const operation = String(args.operation || 'status');
@@ -338,6 +348,60 @@ const TOOLS = [
     },
   },
   {
+    name: 'matrix_tag',
+    description: 'Manage per-machine matrix metadata: projectGroup, role, tags and notes. Used to select targets for matrix_exec_batch and to group matrix_inventory_summary.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        operation: { type: 'string', enum: ['list', 'set', 'remove'] },
+        account: { type: 'string', description: 'Account alias.' },
+        machine_id: { type: 'string', description: 'Sandbox ID or name.' },
+        project_group: { type: 'string', description: 'Project group, e.g. o2a-gateway.' },
+        role: { type: 'string', description: 'Role inside the group.' },
+        tags: { type: 'array', items: { type: 'string' }, description: 'Free-form labels; replaces the stored list on set.' },
+        notes: { type: 'string' },
+      },
+      required: ['operation'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'matrix_exec_batch',
+    description: 'Run one shell command across selected sandboxes in parallel. Select by account, projectGroup, tags or explicit targets (alias:m_id / m_id / name). Returns a per-machine result table plus full stdout/stderr blocks.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: 'Shell command to run on every target.' },
+        account: { type: 'string', description: 'Account alias or "all"; default all enabled.' },
+        project_group: { type: 'string' },
+        tags: { type: 'array', items: { type: 'string' }, description: 'All given tags must be present.' },
+        targets: { type: 'array', items: { type: 'string' }, description: 'Explicit alias:m_id, m_id or machine name.' },
+        concurrency: { type: 'integer', minimum: 1, maximum: 16 },
+        timeout_seconds: { type: 'integer', minimum: 5, maximum: 600 },
+        only_running: { type: 'boolean', description: 'Skip non-running machines; default true.' },
+      },
+      required: ['command'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'matrix_inventory_summary',
+    description: 'Probe every selected sandbox and aggregate a matrix summary by projectGroup: stack blueprints, hostname, memory, disk and probe failures.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        account: { type: 'string', description: 'Account alias or "all"; default all enabled.' },
+        project_group: { type: 'string' },
+        tags: { type: 'array', items: { type: 'string' } },
+        targets: { type: 'array', items: { type: 'string' } },
+        concurrency: { type: 'integer', minimum: 1, maximum: 16 },
+        timeout_seconds: { type: 'integer', minimum: 10, maximum: 300 },
+        only_running: { type: 'boolean', description: 'Skip non-running machines; default true.' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'instabox_files',
     description: 'Browse, read or write files in an Instabox sandbox. list returns a directory table; read returns text content (binary is rejected); write uploads UTF-8 text content up to 4 MiB.',
     inputSchema: {
@@ -494,6 +558,269 @@ async function inventoryTool(args) {
   return ok(inventory.inventoryMarkdown(scanned, args.machine_id));
 }
 
+function describeMeta(meta) {
+  if (!meta) return '—';
+  const parts = [];
+  if (meta.projectGroup) parts.push(meta.projectGroup);
+  if (meta.role) parts.push(meta.role);
+  if (meta.tags && meta.tags.length) parts.push(meta.tags.map((tag) => `#${tag}`).join(' '));
+  return parts.length ? parts.join(' · ') : '—';
+}
+
+function cell(value, max = 80) {
+  return String(value === undefined || value === null ? '' : value)
+    .replace(/\|/g, '\\|')
+    .replace(/\r?\n/g, ' ')
+    .slice(0, max);
+}
+
+async function matrixTagTool(args) {
+  const operation = String(args.operation || 'list');
+  if (operation === 'list') {
+    const state = store.load();
+    if (!state.machineMeta.length) return ok('还没有机器元数据。用 operation=set 写入 project_group / role / tags / notes。');
+    const rows = state.machineMeta.map((meta) => `| ${meta.account} | ${meta.machineId} | ${meta.projectGroup || '—'} | ${meta.role || '—'} | ${(meta.tags || []).join(', ') || '—'} | ${cell(meta.notes, 60)} |`);
+    return ok(['| 账号 | 机器 | 分组 | 角色 | 标签 | 备注 |', '| --- | --- | --- | --- | --- | --- |', ...rows].join('\n'));
+  }
+
+  const alias = String(args.account || '').trim();
+  const machineId = String(args.machine_id || '').trim();
+  if (!alias || !machineId) return fail('需要 account 和 machine_id。');
+  const state = store.load();
+  if (!store.findAccount(state, alias)) return fail(`账号不存在：${alias}`);
+
+  if (operation === 'remove') {
+    await store.update((draft) => {
+      store.removeMachineMeta(draft, alias, machineId);
+    });
+    return ok(`已删除机器元数据：${alias}/${machineId}`);
+  }
+
+  if (operation !== 'set') return fail(`未知 operation：${operation}`);
+
+  const patch = { account: alias, machineId };
+  if (args.project_group !== undefined) patch.projectGroup = args.project_group;
+  if (args.role !== undefined) patch.role = args.role;
+  if (args.tags !== undefined) patch.tags = Array.isArray(args.tags) ? args.tags : [];
+  if (args.notes !== undefined) patch.notes = args.notes;
+  const saved = await store.update((draft) => {
+    store.setMachineMeta(draft, patch);
+    return draft;
+  });
+  const meta = store.findMachineMeta(saved, alias, machineId);
+  if (!meta) return ok(`已清空机器元数据：${alias}/${machineId}`);
+  return ok(`已更新机器元数据：${alias}/${machineId}\n\n${describeMeta(meta)}${meta.notes ? `\n\n${meta.notes}` : ''}`);
+}
+
+async function matrixMachines(state, args) {
+  const requested = String(args.account || 'all').trim() || 'all';
+  const accounts = requested === 'all'
+    ? state.accounts.filter((account) => account.enabled !== false)
+    : [resolveAccount(state, requested)];
+  const wantedGroup = String(args.project_group || '').trim();
+  const wantedTags = (Array.isArray(args.tags) ? args.tags : [])
+    .map((tag) => String(tag || '').trim())
+    .filter(Boolean);
+  const explicit = (Array.isArray(args.targets) ? args.targets : [])
+    .map((target) => String(target || '').trim())
+    .filter(Boolean);
+  const onlyRunning = args.only_running !== false;
+  const entries = [];
+  const errors = [];
+
+  for (const account of accounts) {
+    let machines;
+    try {
+      machines = await client(account, state).listMachines();
+    } catch (error) {
+      errors.push(`${account.alias}: ${error.message}`);
+      continue;
+    }
+    for (const machine of machines) {
+      const meta = store.findMachineMeta(state, account.alias, machine.id);
+      if (explicit.length) {
+        const hit = explicit.some((target) => {
+          if (target.includes(':')) {
+            const [alias, rest] = target.split(':', 2);
+            return alias === account.alias && (rest === machine.id || rest === machine.name);
+          }
+          return target === machine.id || target === machine.name;
+        });
+        if (!hit) continue;
+      }
+      if (wantedGroup && String((meta && meta.projectGroup) || '') !== wantedGroup) continue;
+      if (wantedTags.length) {
+        const tags = (meta && meta.tags) || [];
+        if (!wantedTags.every((tag) => tags.includes(tag))) continue;
+      }
+      if (onlyRunning && machine.state !== 'running') continue;
+      entries.push({ account, machine, meta });
+    }
+  }
+  return { entries, errors };
+}
+
+async function matrixExecBatch(args) {
+  const command = String(args.command || '').trim();
+  if (!command) return fail('command 不能为空。');
+  const state = store.load();
+  const { entries, errors } = await matrixMachines(state, args);
+  const errorNote = errors.length ? `\n\n读取失败：${errors.join('；')}` : '';
+  if (!entries.length) return ok(`没有匹配的机器。${errorNote}`);
+
+  const concurrency = Math.max(1, Math.min(16, Number(args.concurrency) || 4));
+  const timeoutSeconds = Math.max(5, Math.min(600, Number(args.timeout_seconds) || 60));
+  const scheduler = createScheduler({ concurrency, baseMs: 1000 });
+  const byKey = new Map();
+
+  const results = await scheduler.runBatch(entries.map(({ account, machine }) => ({
+    key: `${account.alias}/${machine.id}`,
+    run: async () => {
+      const started = Date.now();
+      try {
+        const result = await client(account, state).exec(machine.id, command, { timeoutSeconds });
+        return { result, ms: Date.now() - started };
+      } catch (error) {
+        return { error: error.message, ms: Date.now() - started };
+      }
+    },
+  })));
+  for (const result of results) {
+    byKey.set(result.key, result.ok ? result.value : { error: result.error, ms: 0 });
+  }
+
+  const lines = [
+    `## 批量执行 · ${entries.length} 台 · 并发 ${concurrency} · 超时 ${timeoutSeconds}s`,
+    '',
+    `\`${command}\``,
+    '',
+    '| 账号 | 机器 | 分组 | 退出码 | 耗时 | 输出 |',
+    '| --- | --- | --- | --- | --- | --- |',
+  ];
+  for (const { account, machine, meta } of entries) {
+    const outcome = byKey.get(`${account.alias}/${machine.id}`) || { error: '未执行', ms: 0 };
+    const okFlag = outcome.result;
+    const exitText = okFlag
+      ? `${okFlag.exitCode}${okFlag.timedOut ? '（超时）' : ''}`
+      : '失败';
+    const summary = okFlag ? (String(okFlag.stdout || '').trim().split(/\r?\n/)[0] || '(无输出)') : outcome.error;
+    lines.push(`| ${cell(account.alias, 24)} | ${cell(machine.name || machine.id, 40)} | ${cell(describeMeta(meta), 40)} | ${exitText} | ${outcome.ms}ms | ${cell(summary)} |`);
+  }
+
+  lines.push('', '## 明细');
+  for (const { account, machine } of entries) {
+    const outcome = byKey.get(`${account.alias}/${machine.id}`) || { error: '未执行' };
+    lines.push('', `### ${account.alias}/${machine.name || machine.id}`);
+    if (!outcome.result) {
+      lines.push('```', `失败：${outcome.error}`, '```');
+      continue;
+    }
+    lines.push('```', String(outcome.result.stdout || '(无 stdout)').slice(0, 4000), '```');
+    if (outcome.result.stderr) lines.push('stderr:', '```', String(outcome.result.stderr).slice(0, 2000), '```');
+  }
+  return ok(lines.join('\n'));
+}
+
+async function matrixInventorySummary(args) {
+  const state = store.load();
+  const { entries, errors } = await matrixMachines(state, args);
+  const errorNote = errors.length ? `\n\n读取失败：${errors.join('；')}` : '';
+  if (!entries.length) return ok(`没有匹配的机器。${errorNote}`);
+
+  const concurrency = Math.max(1, Math.min(16, Number(args.concurrency) || 4));
+  const timeoutSeconds = Math.max(10, Math.min(300, Number(args.timeout_seconds) || 60));
+  const scheduler = createScheduler({ concurrency, baseMs: 1000 });
+  const byKey = new Map();
+
+  const results = await scheduler.runBatch(entries.map(({ account, machine }) => ({
+    key: `${account.alias}/${machine.id}`,
+    run: async () => {
+      const api = client(account, state);
+      return inventoryProbe.probeMachine({
+        exec: (cmd, options = {}) => api.exec(machine.id, cmd, {
+          timeoutSeconds: Math.max(5, Math.round((options.timeoutMs || timeoutSeconds * 1000) / 1000)),
+          noHistory: true,
+        }),
+        timeoutMs: timeoutSeconds * 1000,
+      });
+    },
+  })));
+  for (const result of results) {
+    byKey.set(result.key, result.ok ? result.value : { ok: false, error: result.error });
+  }
+
+  const groups = new Map();
+  let probeOk = 0;
+  const machineRows = [];
+  for (const { account, machine, meta } of entries) {
+    const probe = byKey.get(`${account.alias}/${machine.id}`) || { ok: false, error: '未执行' };
+    const group = (meta && meta.projectGroup) || '(未分组)';
+    const stack = probe.ok
+      ? ([...(probe.blueprints || []).map((item) => item.name), meta && meta.role].filter(Boolean).join(', ') || '—')
+      : '—';
+    if (!groups.has(group)) groups.set(group, { machines: 0, ok: 0, stacks: new Map() });
+    const bucket = groups.get(group);
+    bucket.machines += 1;
+    if (probe.ok) {
+      probeOk += 1;
+      bucket.ok += 1;
+      for (const blueprint of probe.blueprints || []) {
+        bucket.stacks.set(blueprint.name, (bucket.stacks.get(blueprint.name) || 0) + 1);
+      }
+    } else {
+      bucket.stacks.set('探针失败', (bucket.stacks.get('探针失败') || 0) + 1);
+    }
+
+    const disks = probe.ok && probe.disk ? Object.values(probe.disk) : [];
+    const worstDisk = disks.reduce((worst, disk) => {
+      const total = Number(disk.totalKb) || 0;
+      const used = Number(disk.usedKb) || 0;
+      if (!total) return worst;
+      const ratio = used / total;
+      return !worst || ratio > worst.ratio ? { ratio, mount: disk.mount || disk.mountPoint || '?' } : worst;
+    }, null);
+    const memory = probe.ok && probe.memory
+      ? `${Number(probe.memory.usedMiB) || 0}/${Number(probe.memory.totalMiB) || 0} MiB`
+      : '—';
+    machineRows.push(
+      `| ${cell(account.alias, 24)} | ${cell(machine.name || machine.id, 36)} | ${cell(group, 28)} | ` +
+      `${cell((meta && meta.tags || []).join(', ') || '—', 30)} | ${cell(probe.hostname || '—', 28)} | ${cell(stack)} | ` +
+      `${memory} | ${worstDisk ? `${cell(worstDisk.mount, 20)} ${Math.round(worstDisk.ratio * 100)}%` : '—'} |`,
+    );
+  }
+
+  const groupRows = [...groups.entries()].map(([name, bucket]) => {
+    const stacks = [...bucket.stacks.entries()].map(([stack, count]) => `${stack}×${count}`).join(', ') || '—';
+    return `| ${cell(name, 32)} | ${bucket.machines} | ${bucket.ok} | ${cell(stacks, 80)} |`;
+  });
+
+  const lines = [
+    '## 矩阵总览',
+    '',
+    `- 机器：${entries.length} 台（探针成功 ${probeOk} / 失败 ${entries.length - probeOk}）`,
+    `- 分组：${groups.size} 个 · 并发 ${concurrency}`,
+    '',
+    '| 分组 | 机器数 | 探针成功 | 业务栈 |',
+    '| --- | --- | --- | --- |',
+    ...groupRows,
+    '',
+    '| 账号 | 机器 | 分组 | 标签 | 主机名 | 栈 | 内存 | 磁盘峰值 |',
+    '| --- | --- | --- | --- | --- | --- | --- | --- |',
+    ...machineRows,
+  ];
+  const failures = entries
+    .map(({ account, machine }) => ({ account, machine, probe: byKey.get(`${account.alias}/${machine.id}`) }))
+    .filter((item) => !item.probe || !item.probe.ok);
+  if (failures.length) {
+    lines.push('', '## 探针失败');
+    for (const item of failures) {
+      lines.push(`- ${item.account.alias}/${item.machine.name || item.machine.id}: ${(item.probe && item.probe.error) || '未执行'}`);
+    }
+  }
+  if (errorNote) lines.push(errorNote);
+  return ok(lines.join('\n'));
+}
+
 async function manageSnapshot(args) {
   const state = store.load();
   const account = resolveAccount(state, args.account);
@@ -592,7 +919,10 @@ async function keepaliveTool(args) {
   const account = resolveAccount(state, args.account);
   const api = client(account, state);
   const machineId = await resolveMachineId(api, args.machine_id);
-  const keepalive = createKeepalive({});
+  const keepalive = createKeepalive({
+    clientFor: (alias) => client(resolveAccount(store.load(), alias), store.load()),
+    rateLimiter,
+  });
 
   if (operation === 'clear') {
     await keepalive.release(account.alias, machineId).catch(() => {});
@@ -991,6 +1321,9 @@ async function callTool(name, args) {
     case 'instabox_fork_machine': return forkMachineTool(args);
     case 'instabox_list_accounts': return ok(accountList(store.load()));
     case 'instabox_proxy': return proxyTool(args);
+    case 'matrix_tag': return matrixTagTool(args);
+    case 'matrix_exec_batch': return matrixExecBatch(args);
+    case 'matrix_inventory_summary': return matrixInventorySummary(args);
     case 'instabox_files': return filesTool(args);
     case 'instabox_ssh_token': return sshTokenTool(args);
     case 'instabox_desktop': return desktopTool(args);
