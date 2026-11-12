@@ -229,3 +229,38 @@
 1. Sub2Port 绑定 :24001 时，出口 IP 严格等于代理节点 IP；
 2. 手动停掉 :24001 且 failClosed:true 时，该账号 API / Keepalive 立即熔断失败，100% 不回退宿主机直连 IP。
 ```
+
+---
+
+## P0 代码审阅要点（验收时逐条对照）
+
+### A. 若选 vendor/undici：fetch 与 ProxyAgent 必须成对来自同一实例
+
+```js
+const undici = require('../vendor/undici');
+const dispatcher = new undici.ProxyAgent('http://127.0.0.1:24001');
+const fetchImpl = (url, init = {}) => undici.fetch(url, { ...init, dispatcher });
+```
+
+- **禁止**把 `vendor/undici` 的 `ProxyAgent` 传给 `globalThis.fetch(url, { dispatcher })`。
+- 原因：`fetch` 与 `ProxyAgent` 通过私有 `Dispatcher` 协议（`.dispatch(opts, handler)`）耦合；Node 升级内部 undici 时接口可能微调，跨版本混用会出现难查的挂起/报错。
+- 验收：`grep -R "globalThis.fetch" lib/` 在该账号代理路径上应为 0 命中。
+
+### B. 若选自写 fetch 子集：升级 TLS 必须显式 `servername`
+
+```js
+const tlsSocket = tls.connect({
+  socket: rawSocket,
+  servername: targetUrl.hostname,   // 必传：基于已建立 socket 升级时不会自动带 SNI
+  ALPNProtocols: ['http/1.1'],
+});
+```
+
+- 只写 `tls.connect({ socket })` 时**不会自动发送 SNI**，Cloudflare 边缘会直接拒连或降级异常。
+- 同时校验 `tlsSocket.authorized` 与证书主机名；失败按可重试错误处理，但**不得**降级为明文或直连。
+- 验收：抓包确认 ClientHello 里带 `server_name = api.instabox.sh`（或对应目标域）。
+
+### C. 两条硬验收线（P0 完成必须实测）
+
+1. `Sub2Port` 绑定 `:24001` 时，请求观测到的出口 IP **严格等于**代理节点 IP，且 ≠ 宿主机 IP。
+2. 手动停掉 `:24001` 且 `failClosed:true` 时，该账号一切 API / keepalive 请求立即失败；状态进入 `quarantined`，在途请求被 `AbortController` 中止，**零直连回退**（可用宿主侧 tcpdump / 连接表验证目标域无直连）。
