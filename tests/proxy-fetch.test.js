@@ -73,6 +73,28 @@ test('failClosed:false keeps the client usable after a failure', async () => {
   await client.close();
 });
 
+test('cooldown allows one half-open probe and auto-recovers', async () => {
+  const probe = net.createServer();
+  const port = await listen(probe);
+  await new Promise((resolve) => probe.close(resolve));
+  let clock = 1000;
+  const client = createProxyFetch(port, { cooldownMs: 1000, now: () => clock });
+  await assert.rejects(() => client.fetch('http://t.example/'));
+  assert.equal(client.isQuarantined(), true);
+
+  await assert.rejects(() => client.fetch('http://t.example/'), (error) => error.code === 'PROXY_QUARANTINED');
+
+  const proxy = http.createServer((req, res) => res.end('back'));
+  await new Promise((resolve) => proxy.listen(port, '127.0.0.1', resolve));
+  clock += 1001;
+  const response = await client.fetch('http://t.example/');
+  assert.equal(await response.text(), 'back');
+  assert.equal(client.isQuarantined(), false);
+
+  await client.close();
+  await close(proxy);
+});
+
 test('aborting an in-flight request rejects with AbortError', async () => {
   const proxy = http.createServer((req, res) => {
     setTimeout(() => res.end('late'), 200);

@@ -102,6 +102,34 @@ async function resolveMachineId(api, value) {
 const netprobe = createNetProbe();
 const proxies = createAccountProxy({ getState: () => store.load(), log });
 
+async function proxyTool(args) {
+  const operation = String(args.operation || 'status');
+  const state = store.load();
+  const alias = String(args.account || '').trim();
+
+  if (operation === 'release') {
+    proxies.release(alias || undefined);
+    return ok(`已解除代理隔离：${alias || '全部账号'}`);
+  }
+
+  if (operation === 'probe') {
+    const account = resolveAccount(state, alias);
+    const api = client(account, state);
+    const started = Date.now();
+    try {
+      await api.me();
+      proxies.release(account.alias);
+      return ok(`代理可用：${account.alias} → ${proxies.portFor(account.alias) || '未启用'} (${Date.now() - started}ms)`);
+    } catch (error) {
+      return fail(`代理探测失败：${account.alias} → ${error.message}`);
+    }
+  }
+
+  const rows = proxies.status().map((item) =>
+    `| ${item.alias} | ${item.enabled ? '启用' : '停用'} | ${item.port || '—'} | ${item.active ? 'active' : '—'} | ${item.quarantined ? `隔离：${item.reason || ''}` : 'ok'} |`);
+  return ok(['| 账号 | 代理 | 端口 | 客户端 | 状态 |', '| --- | --- | --- | --- | --- |', ...rows].join('\n'));
+}
+
 const TOOLS = [
   {
     name: 'instabox_list_machines',
@@ -295,6 +323,19 @@ const TOOLS = [
     name: 'instabox_list_accounts',
     description: 'List configured Instabox account aliases, key fingerprints, organizations and verification status.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
+    name: 'instabox_proxy',
+    description: 'Inspect or recover the per-account local proxy. status lists ports and quarantine state; release clears quarantine for one account or all; probe makes one real API call through the proxy to confirm recovery.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        operation: { type: 'string', enum: ['status', 'release', 'probe'] },
+        account: { type: 'string', description: 'Account alias; omit for all accounts on release, or the active account on probe.' },
+      },
+      required: ['operation'],
+      additionalProperties: false,
+    },
   },
   {
     name: 'instabox_files',
@@ -949,6 +990,7 @@ async function callTool(name, args) {
     case 'instabox_create_machine': return createMachineTool(args);
     case 'instabox_fork_machine': return forkMachineTool(args);
     case 'instabox_list_accounts': return ok(accountList(store.load()));
+    case 'instabox_proxy': return proxyTool(args);
     case 'instabox_files': return filesTool(args);
     case 'instabox_ssh_token': return sshTokenTool(args);
     case 'instabox_desktop': return desktopTool(args);
