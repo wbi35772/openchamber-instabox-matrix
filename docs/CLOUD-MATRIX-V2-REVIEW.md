@@ -2,6 +2,7 @@
 
 > 审校对象：用户提出的「多云算力矩阵与反关联调度引擎」四大模块方案
 > 基线代码：`openchamber-instabox-matrix` v1.4.0 @ `3655d09`
+> 范围：**本仓库只做 Instabox**；Muse 是独立扩展，不由本仓库实现 provider 抽象。
 > 结论：**方向成立，但有 2 个致命技术错误会让整套反关联失效，必须在开工前改掉。**
 
 ---
@@ -18,7 +19,7 @@
 | 确定性 Persona | ⚠️ 有条件 | 对 REST API 伪造浏览器 UA 往往更可疑，应先抓官方客户端真实请求 |
 | 时区自洽 | ⚠️ 概念错误 | 浏览器无「时区请求头」，时区只在 JS/环境层生效 |
 | SQLite WAL | ✅ 可行 | 用 Node 24 内置 `node:sqlite`，不要引 `better-sqlite3` |
-| Muse 适配器 | ⚠️ 待逆向 | 没有 API 契约前只能先做认证抓包 + 能力探测骨架 |
+| Muse 适配器 | ⚠️ 范围外 | 不在本仓库实现；另建 `muse-matrix` 扩展，通用模块平移过去 |
 
 ---
 
@@ -112,16 +113,16 @@ Node fetch ──TLS(端到端)──> api.instabox.sh
 - 修正：`sub2port` 增加 `binaryPath` 配置（默认读 `PROXYGATE_SINGBOX` 环境变量或扩展 `bin/` 目录），启动前校验版本；缺失时面板给出明确指引，不静默直连。
 - 这对 Kill-Switch 是硬前提：**没有代理进程就必须 fail-closed，不能回退直连。**
 
-### 3.5 Muse 适配器必须按逆向流程做
+### 3.5 Muse 不属于本仓库
 
-- 目前没有任何 Muse API 契约。
-- 修正：先交付 `MuseAdapter` 骨架（`authMode` 探测、会话导入、`listMachines` 探针、能力矩阵），用真实抓包补全；不要在任务书里假设端点。
-- 目录：`lib/providers/muse.js`，接口与 `instabox.js` 对齐。
+- 没有 Muse API 契约，也不应该在本仓库里做 `MuseAdapter`。
+- 修正：本仓库保持 `lib/instabox.js` 纯净；通用能力（存储锁、代理注入、Sub2Port、调度、库存探针）做成可整文件复制的独立模块。Muse 侧另建独立扩展 `muse-matrix`，P0 验收后把这几个模块原样复制过去，再按真实抓包补 Muse 的认证与端点。
+- 结果：本仓库不出现 `lib/providers/`、`MuseAdapter`、`account.provider`。
 
 ### 3.6 账号级限流的落点
 
 - 现有 `InstaboxError.retryAfterSeconds` 已经解析（`lib/instabox.js:187/232`）。
-- 修正：在 `CloudProvider` 基类外包一层 `AccountRateLimiter`（令牌桶 + 429 退避队列），所有 provider 共用；keepalive 调度器只负责「什么时候发」，限流器负责「能不能发」。
+- 修正：`AccountRateLimiter`（令牌桶 + 429 退避队列）作为通用模块独立存在，接口 `limiter.run(key, fn)`，不依赖 provider 基类；keepalive 调度器只负责「什么时候发」，限流器负责「能不能发」。
 
 ### 3.7 泊松抖动要防「抖动后仍撞车」
 
@@ -132,14 +133,14 @@ Node fetch ──TLS(端到端)──> api.instabox.sh
 
 ## 4. 修正后的实施顺序（建议）
 
-1. **P0 存储与 provider 抽象**：`withStateLock`、`node:sqlite` 运行态、`CloudProvider` 基类、`account.provider` 字段（向后兼容）。
-2. **P0 Sub2Port（HTTP inbound 版）**：解析 → 测速 → 生成 sing-box 配置 → 起进程 → 端口健康表 → 粘性绑定 → Kill-Switch。
+1. **P0 存储与通用模块**：`withStateLock`、`node:sqlite` 运行态、`lib/ratelimit.js`；**不做 provider 抽象**。
+2. **P0 Sub2Port（mixed inbound 版）**：解析 → 测速 → 生成 sing-box 配置 → 起进程 → 端口健康表 → 粘性绑定 → Kill-Switch。
 3. **P0 fetch 代理注入**：`undici.ProxyAgent` 包装成每账号 `fetchImpl`；先在单账号验证出口 IP = 节点 IP。
 4. **P1 Persona（先抓包后生成）**：`apiPersona` + `browserPersona`；GeoIP 对齐 `acceptLanguage`。
 5. **P1 调度器**：并发池 4 + 相位偏移 + 抖动 + 每账号在途 1 + 429 队列。
 6. **P1 库存与分组**：`projectGroup/role/tags`、`inspectMachineStack`、批量 MCP。
 7. **P2 面板**：项目矩阵、Sub2Port/Persona 中心、多终端 Tab。
-8. **P2 MuseAdapter**：按抓包结果补全。
+8. **范围外**：Muse 另建 `muse-matrix` 扩展，复制本仓库通用模块后再补认证/端点。
 
 ---
 
@@ -150,6 +151,7 @@ Node fetch ──TLS(端到端)──> api.instabox.sh
 - [ ] 100 个账号的 keepalive 时间戳分布在一个周期内近似均匀（无同秒脉冲）。
 - [ ] `node --test` 覆盖：原子锁、端口映射配置生成、persona 确定性、调度相位、栈解析，全绿。
 - [ ] `sync.mjs --check` 一致。
+- [ ] 若与 `muse-matrix` 同机运行，端口段不冲突（共池 24001..24250，或分段 24001..24099 / 24101..24250）。
 
 ---
 
@@ -169,3 +171,18 @@ Node fetch ──TLS(端到端)──> api.instabox.sh
 - Node 的 `globalThis.fetch` 不接受 `http.Agent`；`dispatcher` 需要 undici 实例 → 零依赖方案是「重写 fetch 子集」，不是「给 fetch 加 Agent」。
 - `mixed` inbound 同时吃 HTTP CONNECT 与 SOCKS5，端口段只保留 `24001..24250`。
 - 换节点/熔断必须销毁缓存的连接池并中止在途请求，否则旧出口会继续复用数秒。
+
+---
+
+## 7. 架构边界（2026-11-12 修订）
+
+Instabox 与 Muse 是两个**独立 OpenChamber 扩展**，由宿主同时挂载各自 MCP 实现统一调度，不做进程内合并。
+
+- 本仓库：`openchamber-instabox-matrix`，只管 Instabox。
+- Muse：另建 `muse-matrix`，复用本仓库打磨好的通用模块：
+  `store-lock.js`、`proxy-fetch.js`、`sub2port.js`、`scheduler.js`、`inventory-probe.js`。
+- 通用模块入参只用 `{key, interval, exec, fetchImpl}` 这类通用结构，禁止出现 Instabox 专属字段。
+- 端口协同两选一：
+  - A 同池：一个 `sing-box` 监听 `24001..24250`，两扩展共用；
+  - B 分段：`instabox` 用 `24001..24099`，`muse` 用 `24101..24250`。
+- `settings.sub2port.basePort` 默认 `24001`，端口上限可配置，兼容两种方式。

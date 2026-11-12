@@ -2,23 +2,25 @@
 
 > 基线：`openchamber-instabox-matrix` v1.4.0 @ `3655d09`
 > 用法：整段发给负责该仓库的编码会话。
-> 本版已修正原方案中 2 个致命错误（SOCKS 不能喂 Node fetch、uTLS 改不了平台 JA3），请按本版实现。
+> 本版已修正原方案中 2 个致命错误（SOCKS 不能喂 Node fetch、uTLS 改不了平台 JA3），并收窄范围：**本仓库只负责 Instabox；Muse 是另一个独立扩展，不复用本仓库的 `lib/providers/`。**
+> 通用模块（存储锁、代理注入、Sub2Port、库存探针、调度器）必须解耦，便于日后整体复制到 `muse-matrix`。
 
 ---
 
-我们要将 `openchamber-instabox-matrix` 从「单平台 Instabox 小工具」升级为多云算力与反关联调度引擎 **OpenChamber Cloud-Matrix v2.0**。
+我们要将 `openchamber-instabox-matrix` 从「单平台 Instabox 小工具」升级为 Instabox 侧的算力矩阵与反关联调度引擎 **OpenChamber Cloud-Matrix v2.0**。
 
-目标场景：同时管理 **100+ Muse 账号（VM）** 和多个 **Instabox 账号（沙箱）**，围绕已部署业务（`o2a-gateway`、`o2a-warp-pool`、`xray-node`、`proxygate-matrix`）分组统计、批量调度、网络隔离与保活。
+目标场景：本扩展管理 **多个 Instabox 账号（沙箱机器）**，围绕已部署业务（`o2a-gateway`、`o2a-warp-pool`、`xray-node`、`proxygate-matrix`）分组统计、批量调度、网络隔离与保活。**Muse（VM）由另一个独立扩展负责**，两者通过 OpenChamber 宿主同时挂载各自 MCP 实现统一调度。
 
 硬约束：
 - 现有单 Instabox 账号配置无需迁移即可运行。
 - Node 运行环境 v24（内置 `fetch`/undici、内置 `node:sqlite`）。
 - 所有代码遵循仓库现有风格（CommonJS、`node --test`、`scripts/sync.mjs`）。
 - 不得引入需要本地编译的原生依赖。
+- **不做多云抽象**：不建 `lib/providers/`、不写 `MuseAdapter`、`accounts[]` 不加 `provider` 字段。
 
 ---
 
-## 模块 1：存储并发加固 + 多云驱动抽象
+## 模块 1：存储并发加固 + 通用模块封装
 
 ### 1.1 原子存储与锁（`lib/store.js`）
 - 实现 `withStateLock(fn)`：
@@ -29,23 +31,24 @@
   - 配置仍存 `state.json`（accounts / keepalive / settings）；
   - 高频运行态（机器探针快照、容器列表、端口健康、日志摘要）存 `data/runtime.db`，用 **Node 24 内置 `node:sqlite`（`DatabaseSync` + WAL）**。不要用 `better-sqlite3`。
 - 迁移：首次启动若无 `data/runtime.db` 则创建；`state.json` schema 保持向后兼容。
+- 该模块不得 import Instabox 专属类型；目标是可以原样复制到 `muse-matrix`。
 
-### 1.2 Provider 抽象（`lib/providers/`）
-- `CloudProvider` 基类，统一方法：
-  `listMachines()`, `getMachine(id)`, `powerAction(id, action)`, `keepalive(entry)`, `execCommand(id, cmd)`, `listFiles(id, path)`, `transferFile(...)`, `getPublishedPorts(id)`, `probeEgress(id)`。
-- `lib/providers/instabox.js`：包装现有 `InstaboxClient`（保持方法签名等价）。
-- `lib/providers/muse.js`：**先交付骨架**，不要假设端点：
-  - `authMode` 探测（API Token / Session Cookie）；
-  - `importSession()` 从浏览器 profile / HAR 导入；
-  - `listMachines()` / `getMachine()` 能力探针，未实现的方法抛出 `not_implemented` 并带明确原因；
-  - 用真实抓包补全，端点集中在 `MUSE_ENDPOINTS` 常量，便于替换。
-- `accounts[]` 新增 `provider: "instabox" | "muse" | "ssh"`，默认 `"instabox"`。
-- 所有 provider 请求统一经过 `AccountRateLimiter`（见 1.3）。
+### 1.2 保持 `lib/instabox.js` 纯净
+- **删除/不要新增** `lib/providers/` 抽象层；`lib/instabox.js` 继续专注 Instabox API。
+- 只做两件事：
+  1. 保留并强化 `fetchImpl` 注入点（P0 的代理注入靠它）；
+  2. 把 `InstaboxError` 的 `retryable / retryAfterSeconds` 语义继续交给通用限流器消费。
+- 通用能力拆成独立文件，不引用 Instabox 字段：
+  - `lib/store-lock.js`（原子写 + 锁 + `node:sqlite`）
+  - `lib/proxy-fetch.js`（代理注入 + SNI + AbortController + quarantined）
+  - `lib/sub2port.js`（订阅 → mixed 端口）
+  - `lib/scheduler.js`（泊松错峰，输入是通用 `{key, interval}`，不认 account 结构）
+  - `lib/inventory-probe.js`（容器栈探针，输入是命令执行函数）
 
 ### 1.3 账号级限流（`lib/ratelimit.js`）
 - 每账号令牌桶（可配置 rps / 并发）；
 - 命中 `429` 或 `retryable` 时读 `retryAfterSeconds`，进入该账号的退避队列，**不影响其他账号**；
-- 对外接口：`limiter.run(account, fn)`。
+- 对外接口：`limiter.run(key, fn)`（`key` 用 alias，保持通用）。
 
 ---
 
@@ -58,12 +61,14 @@
   - 直接对接 `proxygate-matrix` 的 `/sub`。
 - 输出统一节点对象：`{ tag, protocol, server, port, auth, tls, countryHint }`。
 
-### 2.2 单进程多端口生成（**HTTP inbound，不是 SOCKS**）
+### 2.2 单进程多端口生成（**mixed inbound**）
 - 用 `sing-box` 单进程生成一份配置：
-  - 每个账号一个 **HTTP inbound**：`127.0.0.1:24001..24250`（`type: "http"`）；
+  - 每个账号一个 **mixed inbound**：`127.0.0.1:24001..24250`（`type: "mixed"`，起始端口可配置）；
   - 每个 inbound 通过 `route.rules` 静态绑定到唯一 outbound；
   - outbound 上开 `tls.utls` 只是「插件→代理服务器」这一跳的伪装，**不用于欺骗平台**（见 3.2）。
-- 需要给其它工具用 SOCKS 时，另开一段 SOCKS inbound（`25001+`），两套并存。
+- `mixed` 单端口同时识别 HTTP CONNECT 与 SOCKS5：
+  - Node/`fetch` 用 `http://127.0.0.1:24xxx`；
+  - SSH/隧道用 `socks5h://127.0.0.1:24xxx`。
 - 进程管理：
   - `binaryPath` 从 `settings.singboxPath` → 环境变量 `PROXYGATE_SINGBOX` → 扩展 `bin/sing-box(.exe)` 依次查找；
   - 启动前 `--version` 校验；缺失则**不启动代理，直接 fail-closed**；
@@ -80,7 +85,7 @@
 - 所有账号请求默认经本地代理端口；`mode:"direct"` 必须显式设置，默认不允许。
 
 ### 2.4 Node 侧代理注入（关键）
-- `InstaboxClient` / `MuseAdapter` 已支持 `fetchImpl` 注入；新增 `lib/proxy-fetch.js`：
+- `InstaboxClient` 已支持 `fetchImpl` 注入；新增 `lib/proxy-fetch.js`：
   - 用 `undici.ProxyAgent('http://127.0.0.1:<slotPort>')` 构造 dispatcher；
   - 返回绑定该 dispatcher 的 `fetchImpl`；
   - 每个账号一个实例，随 `slotPort` 更换而重建。
@@ -141,7 +146,7 @@
 ### 3.2 两套 Persona
 - `apiPersona`（REST 调用）：贴合官方客户端或稳定 SDK 标识，**不伪造浏览器 UA**。
 - `browserPersona`（仅浏览器自动化）：UA / `sec-ch-ua` / 语言 / 屏幕 / 时区，供 camoufox/playwright 使用。
-- 确定性：`seed = sha256(account.alias + account.provider)`；同一账号重启后画像不变；写入 `account.persona`。
+- 确定性：`seed = sha256(account.alias)`；同一账号重启后画像不变；写入 `account.persona`。（单平台，不需要 provider 维度）
 - **删除「uTLS 洗白平台 JA3」**：平台看到的是 Node→平台的端到端 TLS。若确实需要浏览器级 JA3，另设可选 `impersonate` 模式（curl-impersonate sidecar 或浏览器执行），并在文档说明代价。
 
 ### 3.3 地理自洽
@@ -161,8 +166,8 @@
 ## 模块 4：项目分组、栈识别与深度资产矩阵
 
 ### 4.1 机器元数据
-- `machine.meta = { provider, projectGroup, role, tags: string[], notes }`。
-- 支持按 `projectGroup / provider / 出口 loc / 状态` 四维聚合。
+- `machine.meta = { projectGroup, role, tags: string[], notes }`（不含 provider，单平台）。
+- 支持按 `projectGroup / 出口 loc / 状态` 三维聚合。
 
 ### 4.2 深度栈探针 `inspectMachineStack(machine)`
 - 单次 `exec` 聚合脚本，返回 JSON：
@@ -174,7 +179,7 @@
 
 ### 4.3 批量能力
 - MCP 新增：
-  - `matrix_exec_batch({ targets?, projectGroup?, provider?, tags?, command, concurrency })` → 并发下发，返回逐台结果表；
+  - `matrix_exec_batch({ targets?, projectGroup?, tags?, command, concurrency })` → 并发下发，返回逐台结果表；
   - `matrix_inventory_summary()` → 全网分组统计、存活率、业务容量汇总。
 - 并发度默认 4，可配置；单账号仍受 `AccountRateLimiter`。
 
@@ -188,9 +193,29 @@
 
 ---
 
+## 架构边界：两个独立扩展 + 通用模块平移
+
+Instabox 扩展与 Muse 扩展是**两个独立的 OpenChamber 扩展**，由宿主同时挂载各自 MCP 实现统一调度。
+
+- 本仓库**不建** `lib/providers/`、不写 `MuseAdapter`、`accounts[]` 不加 `provider`。
+- `lib/instabox.js` 保持纯净；通用能力放在可整文件复制的独立模块：
+  `store-lock.js`、`proxy-fetch.js`、`sub2port.js`、`scheduler.js`、`inventory-probe.js`。
+- 这些模块的入参只用通用结构（`{key, interval, exec, fetchImpl}`），不出现 Instabox 专属字段，P0 验收后原样复制到未来的 `muse-matrix/lib/`。
+
+### 本地代理端口协同（两扩展同机）
+
+| 方式 | 做法 | 说明 |
+| --- | --- | --- |
+| A 同池复用（推荐） | 由一个 `sing-box` 进程监听 `24001..24250`，两个扩展共用 `http://127.0.0.1:24xxx` | 省内存；两家平台各自只看到一个独立用户，不跨平台关联 |
+| B 端口段隔离 | `instabox-matrix` 用 `24001..24099`，`muse-matrix` 用 `24101..24250` | 生命周期完全独立；起始端口由配置/常量区分 |
+
+> 本仓库默认实现 `settings.sub2port.basePort = 24001`，并把起始端口与端口段做成配置项，便于方式 B。若采用方式 A，则由独立守护进程或先启动的一方持有 `sing-box`，另一方只读端口清单。
+
+---
+
 ## 交付与验收
 
-1. 兼容：现有 `state.json` 不改即可启动；默认 `provider:"instabox"`、`proxyConfig.mode:"direct"` 需显式确认后才改。
+1. 兼容：现有 `state.json` 不改即可启动；默认 `proxyConfig.mode:"direct"` 需显式确认后才改。
 2. 测试（`node --test` 必须全绿）：
    - 原子锁并发写不丢数据；
    - `sub2port` 生成配置的 inbound→outbound 1:1 正确、端口连续；
@@ -212,9 +237,11 @@
 - docs/CLOUD-MATRIX-V2-REVIEW.md
 
 只聚焦落地 P0 的三件事：
-1. 原子存储与状态锁（lib/store.js + Node 24 内置 node:sqlite WAL，PRAGMA busy_timeout=5000）+ Provider 抽象（lib/providers/）；
-2. Sub2Port 本地端口映射引擎（lib/sub2port.js）；
+1. 原子存储与状态锁（lib/store.js + Node 24 内置 node:sqlite WAL，PRAGMA busy_timeout=5000）；**不要建 lib/providers/，不做多云抽象**；
+2. Sub2Port 本地端口映射引擎（lib/sub2port.js，起始端口可配置，默认 24001）；
 3. 每账号代理注入与 failClosed 断流熔断（Kill-Switch）。
+
+架构边界（重要）：Instabox 与 Muse 是两个独立扩展，由 OpenChamber 宿主同时挂载。本仓库只做 Instabox，保持 lib/instabox.js 纯净；通用能力拆成 store-lock / proxy-fetch / sub2port / scheduler / inventory-probe，入参不含 Instabox 专属字段，便于日后原样复制到 muse-matrix。
 
 编写 P0 时重点把控 3 个工程细节：
 1. 零依赖兼容 scripts/sync.mjs：sync 只复制 lib/service/mcp/panel + package.json/icon.svg/README.md，不同步 node_modules；Node v24 不允许裸 require('undici')（已实测 MODULE_NOT_FOUND，内部版本 7.30.1 但不暴露）。二选一：
