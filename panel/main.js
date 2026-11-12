@@ -940,6 +940,7 @@
     if (spec.kind === 'exec') return renderExecModal(root, spec);
     if (spec.kind === 'snapshots') return renderSnapshotsModal(root, spec);
     if (spec.kind === 'ports') return renderPortsModal(root, spec);
+    if (spec.kind === 'matrix') return renderMatrixModal(root, spec);
     if (spec.kind === 'delete') return renderDeleteModal(root, spec);
     if (spec.kind === 'detail') return renderDetailModal(root, spec);
     root.innerHTML = '';
@@ -2578,6 +2579,181 @@
     }
   }
 
+  /* ------------------------------------------------------------------ */
+  /* matrix board                                                        */
+  /* ------------------------------------------------------------------ */
+
+  function renderMatrixModal(root, spec) {
+    var metaMap = {};
+    (spec.meta || []).forEach(function (meta) {
+      metaMap[meta.account + ':' + meta.machineId] = meta;
+    });
+    var machines = machinesOf(state.overview);
+    if (state.selected !== 'all') {
+      machines = machines.filter(function (machine) { return machine.account === state.selected; });
+    }
+    var groups = {};
+    var order = [];
+    machines.forEach(function (machine) {
+      var meta = metaMap[machine.account + ':' + machine.id] || {};
+      var group = meta.projectGroup || '未分组';
+      if (!groups[group]) { groups[group] = []; order.push(group); }
+      groups[group].push({ machine: machine, meta: meta });
+    });
+    order.sort(function (a, b) {
+      if (a === '未分组') return 1;
+      if (b === '未分组') return -1;
+      return a.localeCompare(b);
+    });
+
+    var body = [];
+    body.push('<div class="matrix-bar">');
+    body.push('<span class="hint grow">' + machines.length + ' 台机器 · 按分组折叠 · 标签用逗号分隔</span>');
+    body.push('<button class="ghost-btn" data-act="matrix-pick" data-mode="running">勾选运行中</button>');
+    body.push('<button class="ghost-btn" data-act="matrix-pick" data-mode="none">全不选</button>');
+    body.push('</div>');
+    body.push('<div class="matrix-list">');
+    order.forEach(function (group) {
+      var items = groups[group];
+      var running = items.filter(function (item) { return item.machine.state === 'running'; }).length;
+      body.push('<div class="matrix-group">');
+      body.push('<div class="matrix-group-head"><strong>' + esc(group) + '</strong><span class="tag">' + running + '/' + items.length + '</span></div>');
+      items.forEach(function (item) {
+        var machine = item.machine;
+        var meta = item.meta;
+        body.push([
+          '<div class="matrix-row" data-account="' + esc(machine.account) + '" data-machine="' + esc(machine.id) + '">',
+          '<label class="matrix-pick"><input type="checkbox" data-matrix-pick data-state="' + esc(machine.state || '') + '" data-account="' + esc(machine.account) + '" data-machine="' + esc(machine.id) + '"' + (machine.state === 'running' ? ' checked' : '') + ' /></label>',
+          '<div class="matrix-id"><strong>' + esc(machine.name || machine.id) + '</strong><span>' + esc(machine.id) + ' · ' + esc(machine.account) + ' · ' + esc(machine.state || 'unknown') + '</span></div>',
+          '<input class="input mono matrix-input" data-meta="group" placeholder="分组" value="' + esc(meta.projectGroup || '') + '" />',
+          '<input class="input mono matrix-input" data-meta="role" placeholder="角色" value="' + esc(meta.role || '') + '" />',
+          '<input class="input mono matrix-input" data-meta="tags" placeholder="a,b" value="' + esc((meta.tags || []).join(',')) + '" />',
+          '<button class="ghost-btn matrix-save" data-act="save-matrix-meta" title="保存分组">' + icon('check') + '</button>',
+          '</div>',
+        ].join(''));
+      });
+      body.push('</div>');
+    });
+    if (!machines.length) body.push('<div class="hint" style="padding:12px">当前筛选下没有机器。</div>');
+    body.push('</div>');
+    body.push('<div class="matrix-batch">');
+    body.push('<div class="form-grid two">');
+    body.push(field('批量命令', '<textarea class="input mono" id="matrix-cmd" rows="3" placeholder="uname -a && uptime"></textarea>'));
+    body.push(field('超时（秒） / 并发', '<div class="matrix-inline"><input class="input mono" id="matrix-timeout" type="number" min="1" max="600" value="60" /><input class="input mono" id="matrix-concurrency" type="number" min="1" max="8" value="3" /></div>'));
+    body.push('</div>');
+    body.push('<div class="matrix-bar"><span class="hint grow" id="matrix-batch-status">勾选机器后下发，逐台汇总结果</span><button class="primary-btn" data-act="run-matrix-batch">' + icon('bolt') + '执行</button></div>');
+    body.push('<pre class="matrix-results" id="matrix-results"></pre>');
+    body.push('</div>');
+
+    root.innerHTML = modalShell('项目矩阵', 'agent', body.join(''), '<button class="ghost-btn" data-act="close-modal">关闭</button>', true);
+  }
+
+  async function openMatrix() {
+    var meta = [];
+    try {
+      var data = await service('GET', '/api/matrix');
+      meta = data.meta || [];
+    } catch (error) {
+      toast(describeError(error), 'error');
+      return;
+    }
+    openModal({ kind: 'matrix', meta: meta });
+  }
+
+  async function saveMatrixMeta(button) {
+    var row = button.closest('.matrix-row');
+    if (!row) return;
+    var tags = (row.querySelector('[data-meta="tags"]').value || '').split(',')
+      .map(function (value) { return value.trim(); })
+      .filter(Boolean);
+    await withButton(button, async function () {
+      var data = await service('PUT', '/api/matrix/meta', {
+        body: {
+          account: row.dataset.account,
+          machineId: row.dataset.machine,
+          projectGroup: row.querySelector('[data-meta="group"]').value.trim(),
+          role: row.querySelector('[data-meta="role"]').value.trim(),
+          tags: tags,
+        },
+      });
+      var spec = state.modal;
+      if (spec && spec.kind === 'matrix') {
+        spec.meta = (spec.meta || []).filter(function (meta) {
+          return !(meta.account === row.dataset.account && meta.machineId === row.dataset.machine);
+        });
+        if (data.meta) spec.meta.push(data.meta);
+      }
+      toast('分组已保存', 'success');
+    });
+  }
+
+  async function execJob(alias, machineId, cmd, timeoutSeconds, noHistory) {
+    var started = await service('POST', '/api/machines/' + encodeURIComponent(alias) + '/' + encodeURIComponent(machineId) + '/exec', {
+      body: { cmd: cmd, timeoutSeconds: timeoutSeconds, noHistory: Boolean(noHistory) },
+      timeoutMs: 15000,
+    });
+    var jobId = started.jobId;
+    var deadline = Date.now() + (timeoutSeconds + 15) * 1000;
+    var job = null;
+    while (Date.now() < deadline) {
+      await new Promise(function (resolve) { setTimeout(resolve, 700); });
+      job = await service('GET', '/api/jobs/' + encodeURIComponent(jobId), { timeoutMs: 15000 });
+      if (job.status !== 'running') break;
+    }
+    if (!job || job.status === 'running') throw new Error('执行超时：任务仍在运行');
+    if (job.status === 'error') throw new Error(typeof job.error === 'string' ? job.error : (job.error && job.error.message) || '任务失败');
+    return job.result || {};
+  }
+
+  async function runMatrixBatch(button) {
+    var cmd = (($('#matrix-cmd') || {}).value || '').trim();
+    if (!cmd) { toast('先输入批量命令', 'error'); return; }
+    var timeout = Math.max(1, Math.min(600, Number(($('#matrix-timeout') || {}).value) || 60));
+    var concurrency = Math.max(1, Math.min(8, Number(($('#matrix-concurrency') || {}).value) || 3));
+    var picks = Array.prototype.slice.call(document.querySelectorAll('[data-matrix-pick]:checked')).map(function (input) {
+      return { account: input.dataset.account, machineId: input.dataset.machine };
+    });
+    if (!picks.length) { toast('先勾选至少一台机器', 'error'); return; }
+
+    var out = $('#matrix-results');
+    var status = $('#matrix-batch-status');
+    var slots = picks.map(function (pick) { return '· ' + pick.account + '/' + pick.machineId + ' 等待'; });
+    function renderLines() { if (out) out.textContent = slots.join('\n'); }
+    renderLines();
+
+    await withButton(button, async function () {
+      var cursor = 0;
+      var done = 0;
+      if (status) status.textContent = '0/' + picks.length + ' 完成，并发 ' + concurrency + '…';
+      async function worker() {
+        while (cursor < picks.length) {
+          var index = cursor;
+          cursor += 1;
+          var pick = picks[index];
+          slots[index] = '▶ ' + pick.account + '/' + pick.machineId + ' 运行中…';
+          renderLines();
+          try {
+            var result = await execJob(pick.account, pick.machineId, cmd, timeout, true);
+            var text = result.stdout || '';
+            var tail = text.length > 400 ? text.slice(0, 400) + '\n…' : text;
+            slots[index] = '✔ ' + pick.account + '/' + pick.machineId + '  exit=' + result.exitCode
+              + (result.timedOut ? ' 超时' : '') + (result.truncated ? ' 截断' : '')
+              + (tail ? '\n' + tail : '');
+          } catch (error) {
+            slots[index] = '✖ ' + pick.account + '/' + pick.machineId + '  ' + describeError(error);
+          }
+          done += 1;
+          if (status) status.textContent = done + '/' + picks.length + ' 完成';
+          renderLines();
+        }
+      }
+      var workers = [];
+      for (var i = 0; i < Math.min(concurrency, picks.length); i += 1) workers.push(worker());
+      await Promise.all(workers);
+      if (status) status.textContent = '完成：' + done + '/' + picks.length;
+    });
+  }
+
   async function runExec(button) {
     var cmd = ($('#exec-cmd') || {}).value || '';
     if (!cmd.trim()) { toast('先输入命令', 'error'); return; }
@@ -2861,6 +3037,16 @@
       if (act === 'probe-net') { probeNetwork([el.dataset.machine], el); return; }
       if (act === 'probe-net-all') { probeNetwork(null, el); return; }
       if (act === 'settings') { openModal({ kind: 'settings' }); return; }
+      if (act === 'matrix') { openMatrix(); return; }
+      if (act === 'save-matrix-meta') { saveMatrixMeta(el); return; }
+      if (act === 'run-matrix-batch') { runMatrixBatch(el); return; }
+      if (act === 'matrix-pick') {
+        var pickMode = el.dataset.mode;
+        Array.prototype.forEach.call(document.querySelectorAll('[data-matrix-pick]'), function (input) {
+          input.checked = pickMode === 'none' ? false : input.dataset.state === 'running';
+        });
+        return;
+      }
       if (act === 'add-account') { openModal({ kind: 'account' }); return; }
       if (act === 'create-machine') {
         if (!state.accounts.length) { openModal({ kind: 'account' }); return; }

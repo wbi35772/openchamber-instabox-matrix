@@ -404,6 +404,31 @@ async function route(req, res, url) {
     throw new InstaboxError('方法不允许', { code: 'method_not_allowed', status: 405 });
   }
 
+  if (method === 'GET' && path === '/api/matrix') {
+    const state = store.load();
+    return send(res, 200, { ok: true, meta: state.machineMeta || [] });
+  }
+
+  if (method === 'PUT' && path === '/api/matrix/meta') {
+    const body = await readBody(req);
+    const account = String(body.account || '').trim();
+    const machineId = String(body.machineId || '').trim();
+    if (!account || !machineId) {
+      throw new InstaboxError('缺少 account 或 machineId', { code: 'bad_request', status: 400 });
+    }
+    const state = store.load();
+    const patch = { account, machineId };
+    if (body.projectGroup !== undefined) patch.projectGroup = body.projectGroup;
+    if (body.role !== undefined) patch.role = body.role;
+    if (body.notes !== undefined) patch.notes = body.notes;
+    if (body.tags !== undefined) {
+      patch.tags = Array.isArray(body.tags) ? body.tags : String(body.tags).split(',');
+    }
+    const meta = store.setMachineMeta(state, patch);
+    store.save(state);
+    return send(res, 200, { ok: true, meta });
+  }
+
   if (method === 'GET' && path === '/api/keepalive') {
     return send(res, 200, { ok: true, keepalive: store.load().keepalive });
   }
