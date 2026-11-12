@@ -364,5 +364,14 @@ curl -sS -x http://127.0.0.1:24001 https://api.ipify.org --max-time 5
 - 修复：`lib/sub2port.js` 之前丢弃 `transport`；vless/trojan/vmess 现在输出 ws（path + Host）、grpc、http transport；新增回归测试，147/147 通过。
 - 硬线 2（零直连）通过：停掉 sing-box 后 `curl -x http://127.0.0.1:24001` 13ms 失败（exit 7）；`createProxyFetch` 首次 `PROXY_REQUEST_FAILED`、随后 `PROXY_QUARANTINED`，本地计数目标 0 次命中；同机直连仍为 `1.196.187.141`。
 - 硬线 1（出口 IP == 节点 IP）不成立：同一端口连续 3 次出口为 `185.17.122.89` / 证书错误 / `82.21.117.93`；24002 为 `37.220.82.145` → `167.99.246.140` → `46.249.99.199`。该订阅是轮换出口/中转，不是固定节点，不能用「等于节点 IP」判定。可复现结论：流量确实经代理（≠ 本机 `1.196.187.141`），但出口随机。
-- 要满足硬线 1，需要固定出口节点（直连 IP 的 vless/trojan，无 CDN/中转），用同样两条命令复测。
+- 该轮换订阅不用于硬线 1；固定节点复测见下节。
+
+## 固定节点复测：Instabox 8443（2026-11-12）
+
+节点：`vless://b94b…@8443-agq4uw3nnf2ckra45gcrdcoyf4.instabox.tech:443?type=ws&path=/proxy`（用户自有）。
+
+- 配置：`outbound/vless` + `transport ws path=/proxy`、Host 同名，TLS SNI 同名，`utls chrome`。
+- 硬线 1 **通过**：`:24001` 连续 3 次出口 `35.88.80.47`；机器内 `curl -4` 同为 `35.88.80.47`；本机直连 `1.196.187.141`。机器 `curl -6` 为 `2600:1f14:34cf:7b00:7236::b`，即该节点 IPv4 出口固定且等于节点自身 IPv4。
+- 生产链路端到端：`store.load → createAccountProxy(enabled, ports[alias]=24001) → InstaboxClient.listMachines()` 返回 `machines=1`；sing-box 日志 `inbound/mixed[slot-24001] → outbound/vless[node-1] → api.instabox.sh:443`。
+- 硬线 2 **通过**：停 sing-box 后同一调用 71ms 失败（`proxy quarantined … ECONNREFUSED` → `network_error`）；同机直连 `https://api.instabox.sh/v1/machines` 仍返回 401（可达），证明没有回退直连。
 
