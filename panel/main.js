@@ -762,11 +762,21 @@
     var modes = ['lease', 'knock', 'both'];
     var mode = keepalive && keepalive.mode ? keepalive.mode : 'lease';
     var kaLabel = '关闭';
+    var kaRetryAt = keepalive && keepalive.retryAt ? Date.parse(keepalive.retryAt) : NaN;
+    var kaCooling = Number.isFinite(kaRetryAt) && kaRetryAt > Date.now();
     if (keepalive) {
-      if (keepalive.lastOk === false) kaLabel = '失败';
+      if (kaCooling) kaLabel = '冷却至 ' + String(keepalive.retryAt).slice(11, 16);
+      else if (keepalive.lastOk === false) kaLabel = '失败';
       else if (keepalive.expiresAt) kaLabel = '租约至 ' + String(keepalive.expiresAt).slice(11, 16);
       else if (keepalive.lastOk === true) kaLabel = '已触发';
       else kaLabel = '待运行';
+    }
+    var kaStatus = [];
+    if (keepalive) {
+      if (keepalive.lastWakeAt) kaStatus.push('上次唤醒 ' + String(keepalive.lastWakeAt).slice(11, 16));
+      if (kaCooling) kaStatus.push('自动重试 ' + String(keepalive.retryAt).slice(11, 16));
+      kaStatus.push('累计 ' + (Number(keepalive.runs) || 0) + ' 次');
+      if (keepalive.lastError) kaStatus.push('错误: ' + String(keepalive.lastError).slice(0, 90));
     }
 
     return [
@@ -818,6 +828,8 @@
       '<span></span>',
       '</label>',
       '</div>',
+
+      '<div class="keepalive-status">' + esc(kaStatus.length ? kaStatus.join(' · ') : '保活未开启') + '</div>',
 
       '<div class="card-actions">',
       actionsFor(machine, busy).join(''),
@@ -1406,6 +1418,22 @@
       metaItem('本次启动', uptimeDetail ? fmtDate(uptimeDetail.startedAt) : '—'),
       metaItem('创建时间', fmtDate(machine.createdAt)),
     ];
+    var ka = machine.keepalive || null;
+    var kaCooling = Boolean(ka && ka.retryAt && Date.parse(ka.retryAt) > Date.now());
+    var kaMode = ka && ka.enabled
+      ? (ka.mode || 'lease') + (ka.ttlSeconds ? ' · ' + fmtMinutes(Math.round(ka.ttlSeconds / 60)) : '')
+      : '关闭';
+    var kaWake = ka && ka.lastWakeAt
+      ? fmtDate(ka.lastWakeAt) + (ka.lastWakeAction ? ' (' + ka.lastWakeAction + ')' : '')
+      : '—';
+    rows.push(
+      metaItem('保活', kaMode, ka && ka.enabled ? 'ok' : ''),
+      metaItem('租约至', ka && ka.expiresAt ? fmtDate(ka.expiresAt) : '—', kaCooling ? 'warn' : ''),
+      metaItem('冷却唤醒', ka && ka.autoWake ? '开' : '关'),
+      metaItem('上次唤醒', kaWake, ka && ka.lastOk === false ? 'warn' : ''),
+      metaItem('下次重试', kaCooling ? fmtDate(ka.retryAt) : '—', kaCooling ? 'warn' : ''),
+      metaItem('最近错误', ka && ka.lastError ? String(ka.lastError).slice(0, 120) : '无', ka && ka.lastError ? 'bad' : ''),
+    );
     var connection = machine.connection;
     var ssh = '';
     if (connection && connection.host) {
@@ -1975,6 +2003,7 @@
       '<div class="terminal-head">',
       '<span class="tag ok" id="terminal-state">连接中…</span>',
       '<span class="grow sub" id="terminal-hint">持久 shell · 关闭标签会断开本地连接</span>',
+      '<span class="terminal-metrics" id="terminal-metrics"></span>',
       '</div>',
       '<div class="terminal-host" id="terminal-host"></div>',
       '<div class="hint">终端走 Instabox WebSocket；远端 shell 在断开后继续运行，重新打开会重放最近输出。</div>',
@@ -1997,6 +2026,7 @@
     if (!t) return;
     t.disposed = true;
     if (t.timer) { clearInterval(t.timer); t.timer = null; }
+    if (t.guard) { clearInterval(t.guard); t.guard = null; }
     if (t.observer) { try { t.observer.disconnect(); } catch (error) { /* ignore */ } t.observer = null; }
     if (t.term) { try { t.term.dispose(); } catch (error) { /* ignore */ } t.term = null; }
     if (state.modal) state.modal.terminal = null;
@@ -2046,10 +2076,37 @@
     });
   }
 
+  function guardTerminalGeometry(t, term, host) {
+    if (t.disposed) return;
+    var vh = window.innerHeight || 800;
+    var modal = document.querySelector('.modal');
+    var body = document.getElementById('detail-body');
+    var cap = Math.max(240, vh - 32);
+    if (modal && modal.getBoundingClientRect().height > cap + 1) {
+      modal.style.maxHeight = cap + 'px';
+    }
+    if (body) {
+      var bcap = Math.max(160, Math.min(Math.round(vh * 0.7), 640));
+      if (body.getBoundingClientRect().height > bcap + 1) body.style.maxHeight = bcap + 'px';
+    }
+    if (host) {
+      var hh = vh <= 720 ? 320 : 420;
+      if (Math.abs(host.getBoundingClientRect().height - hh) > 2) host.style.height = hh + 'px';
+      host.style.maxHeight = Math.round(vh * 0.6) + 'px';
+    }
+    var m = document.getElementById('terminal-metrics');
+    if (m) {
+      m.textContent = 'H' + Math.round(modal ? modal.getBoundingClientRect().height : 0) +
+        ' B' + Math.round(body ? body.getBoundingClientRect().height : 0) +
+        ' T' + Math.round(host ? host.getBoundingClientRect().height : 0) +
+        ' R' + ((term && term.rows) || 0);
+    }
+  }
+
   async function startTerminal(machine) {
     var host = $('#terminal-host');
     if (!host || !state.modal) return;
-    var t = { disposed: false, timer: null, polling: false, cursor: 0, sessionId: null, term: null, observer: null };
+    var t = { disposed: false, timer: null, polling: false, cursor: 0, sessionId: null, term: null, observer: null, guard: null };
     state.modal.terminal = t;
     if (typeof window.Terminal !== 'function') {
       setTerminalState('xterm 未加载', 'bad');
@@ -2095,6 +2152,8 @@
     term.open(host);
     if (fit) { try { fit.fit(); } catch (error) { /* ignore */ } }
     term.focus();
+    guardTerminalGeometry(t, term, host);
+    t.guard = setInterval(function () { guardTerminalGeometry(t, term, host); }, 400);
 
     term.onResize(function (size) {
       if (t.disposed || !t.sessionId) return;

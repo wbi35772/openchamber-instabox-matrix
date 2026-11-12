@@ -276,7 +276,7 @@ test('autoWake respects machine_cooldown and backs off without renewing', async 
   assert.match(patches[0].patch.lastError, /cooling down/);
 });
 
-test('autoWake does not wake while retryAt is in the future or without a backoff', async () => {
+test('autoWake wakes without a backoff, but not while retryAt is in the future', async () => {
   let powerCalls = 0;
   const client = fakeClient(
     () => ({ expiresAt: iso(T0 + 900000) }),
@@ -297,8 +297,41 @@ test('autoWake does not wake while retryAt is in the future or without a backoff
 
   const normal = makeEntry({ expiresAt: iso(T0 + 1000), leaseId: 'oc-x', autoWake: true });
   const renewed = await tickEntries([normal], { now: () => T0, clientFor: () => client });
-  assert.equal(powerCalls, 0);
+  assert.equal(powerCalls, 1);
+  assert.equal(renewed[0].patch.lastWakeAction, 'wake');
   assert.equal(renewed[0].patch.lastOk, true);
+});
+
+test('autoWake skips the wake chain when the machine is already awake', async () => {
+  let powerCalls = 0;
+  const client = {
+    async putLease() {
+      return { expiresAt: iso(T0 + 900000) };
+    },
+    async deleteLease() {
+      return {};
+    },
+    async power() {
+      powerCalls += 1;
+      return {};
+    },
+    async getMachine() {
+      return { id: 'm_demo', state: 'running' };
+    },
+  };
+  const entry = makeEntry({
+    expiresAt: iso(T0 + 1000),
+    leaseId: 'oc-x',
+    retryAt: iso(T0 - 1000),
+    autoWake: true,
+  });
+
+  const patches = await tickEntries([entry], { now: () => T0, clientFor: () => client });
+
+  assert.equal(powerCalls, 0);
+  assert.equal(patches[0].patch.lastWakeAction, 'skip:running');
+  assert.equal(patches[0].patch.retryAt, null);
+  assert.equal(patches[0].patch.lastOk, true);
 });
 
 test('autoWake retries a failed wake at most once a minute', async () => {
