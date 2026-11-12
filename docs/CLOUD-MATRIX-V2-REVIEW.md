@@ -152,6 +152,7 @@ Node fetch ──TLS(端到端)──> api.instabox.sh
 - [ ] `node --test` 覆盖：原子锁、端口映射配置生成、persona 确定性、调度相位、栈解析，全绿。
 - [ ] `sync.mjs --check` 一致。
 - [ ] 若与 `muse-matrix` 同机运行，端口段不冲突（共池 24001..24250，或分段 24001..24099 / 24101..24250）。
+- [ ] 6 个通用模块可在独立子进程单独 `require`，源码中平台特征字符串 0 命中。
 
 ---
 
@@ -186,3 +187,16 @@ Instabox 与 Muse 是两个**独立 OpenChamber 扩展**，由宿主同时挂载
   - A 同池：一个 `sing-box` 监听 `24001..24250`，两扩展共用；
   - B 分段：`instabox` 用 `24001..24099`，`muse` 用 `24101..24250`。
 - `settings.sub2port.basePort` 默认 `24001`，端口上限可配置，兼容两种方式。
+
+### 7.1 零反向依赖（硬红线）
+
+- 允许：`lib/instabox.js`、`lib/leases.js`、`service/main.js`、`panel` → `require` 6 个通用模块。
+- 禁止：6 个模块内部 `require('./instabox')`，或硬编码 `api.instabox.sh`、`ibk_`、`m_`、平台错误码。
+- 连通性自检 URL、SNI、端口、订阅源全部由调用方/配置传入。
+- 自检：每个模块独立子进程 `require` 成功；`grep` 平台特征字符串为 0。
+
+### 7.2 sing-box 二进制与端口池共享
+
+- `singBoxBin` 解析：`settings.singboxPath` → `PROXYGATE_SINGBOX` → `SINGBOX_BIN` → 共享 shardx 路径 → 扩展 `bin/` → `PATH`。
+- 共享池必须单实例：`data/singbox-<basePort>.lock` 记录 `{pid, portRange, configHash, startedAt}`；持有者起进程与 `SIGHUP`，其他扩展只读；pid 失效才可重新选举。
+- `mixed` 端口同时服务：浏览器用 `socks5h://127.0.0.1:24xxx`，扩展 API 用 `http://127.0.0.1:24xxx`。

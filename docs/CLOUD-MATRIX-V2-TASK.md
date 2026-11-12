@@ -70,8 +70,15 @@
   - Node/`fetch` 用 `http://127.0.0.1:24xxx`；
   - SSH/隧道用 `socks5h://127.0.0.1:24xxx`。
 - 进程管理：
-  - `binaryPath` 从 `settings.singboxPath` → 环境变量 `PROXYGATE_SINGBOX` → 扩展 `bin/sing-box(.exe)` 依次查找；
+  - `singBoxBin` 解析顺序（全部可配置，不写死）：
+    1. `settings.singboxPath`
+    2. 环境变量 `PROXYGATE_SINGBOX`
+    3. 环境变量 `SINGBOX_BIN`
+    4. 同机共享路径（可配置）：`<proxygate-nodes>/shardx/sing-box(.exe)`，默认探测 `projects/proxygate-matrix/proxygate-nodes/shardx/`
+    5. 扩展自身 `bin/sing-box(.exe)`
+    6. `PATH` 中的 `sing-box`
   - 启动前 `--version` 校验；缺失则**不启动代理，直接 fail-closed**；
+  - 共享池需要一个**单实例所有者**：`data/singbox-<basePort>.lock` 记录 `{pid, portRange, configHash, startedAt}`。持有者负责起进程与 `SIGHUP`；其他扩展只读锁文件和端口清单，不得重复启动；持有者进程已死（pid 不存在）才可重新选举。
   - 配置变更先写临时文件，校验通过再 `SIGHUP`/重启，失败回滚上一版。
 
 ### 2.3 粘性绑定与 Kill-Switch
@@ -211,6 +218,35 @@ Instabox 扩展与 Muse 扩展是**两个独立的 OpenChamber 扩展**，由宿
 
 > 本仓库默认实现 `settings.sub2port.basePort = 24001`，并把起始端口与端口段做成配置项，便于方式 B。若采用方式 A，则由独立守护进程或先启动的一方持有 `sing-box`，另一方只读端口清单。
 
+### 通用模块零反向依赖（硬红线）
+
+依赖方向只允许单向：
+
+```
+lib/instabox.js / lib/leases.js / service/main.js / panel
+        └── require ──> store-lock / proxy-fetch / sub2port / scheduler / inventory-probe / ratelimit
+```
+
+这 6 个模块内部**严禁**：
+- `require('./instabox')` 或任何平台客户端；
+- 硬编码 `api.instabox.sh`、`ibk_`、`m_`、平台专有错误码；
+- 把平台字段写进入参（只接受 `{key, interval, exec, fetchImpl, singBoxBin, basePort, traceUrl, sni}` 等通用参数）。
+
+自检（P0 必须加）：
+- 每个模块用全新子进程单独 `require()`，不加载 `lib/instabox.js` 也能成功；
+- `grep -R "instabox\|ibk_\|api\.instabox\|'m_" lib/store-lock.js lib/proxy-fetch.js lib/sub2port.js lib/scheduler.js lib/inventory-probe.js lib/ratelimit.js` 为 0 命中；
+- 连通性自检 URL、SNI 主机名、代理端口一律由调用方传入，模块内无默认平台域名。
+
+### 跨扩展复用清单
+
+| 扩展 | 复用方式 |
+| --- | --- |
+| `muse-matrix`（待建） | 复制 6 个模块 + 面板框架，只新增 `lib/muse.js` 客户端 |
+| `instacloud` | 复用 `store-lock`、`ratelimit`、`inventory-probe`（多账号配额 / 429 / 容器巡检） |
+| `shardx-workspace` | 共用同一个 `sing-box` 进程与 `24001..24250` mixed 池：浏览器走 `socks5h://`，扩展 API 走 `http://` |
+
+> 共享池的安全前提是「单实例所有者 + 锁文件」；没有锁就重复起进程会抢端口，这一条与 P0 一起验收。
+
 ---
 
 ## 交付与验收
@@ -223,6 +259,8 @@ Instabox 扩展与 Muse 扩展是**两个独立的 OpenChamber 扩展**，由宿
    - `scheduler` 相位/抖动分布无同秒聚集；
    - `inventory` 栈解析在样例 JSON 上正确；
    - Kill-Switch：代理不可用时请求必须失败，不回退直连。
+   - 零反向依赖：6 个通用模块各自在独立子进程 `require` 成功，且源码中无平台特征字符串。
+   - 共享池单实例：两个进程同时尝试持锁，只有一个启动 `sing-box`，另一个进入只读模式。
 3. `node scripts/sync.mjs` 同步安装目录，`--check` 一致。
 4. 更新 `docs/MULTI-ACCOUNT-ASSESSMENT.md` 为 v2.0 架构说明，并新增 `docs/CLOUD-MATRIX-V2.md`（本任务书）。
 5. 先做 P0（模块 1 + 2 + fetch 注入），单账号验证「出口 IP = 节点 IP、断代理即失败」，再继续 P1/P2。
@@ -243,7 +281,7 @@ Instabox 扩展与 Muse 扩展是**两个独立的 OpenChamber 扩展**，由宿
 
 架构边界（重要）：Instabox 与 Muse 是两个独立扩展，由 OpenChamber 宿主同时挂载。本仓库只做 Instabox，保持 lib/instabox.js 纯净；通用能力拆成 store-lock / proxy-fetch / sub2port / scheduler / inventory-probe，入参不含 Instabox 专属字段，便于日后原样复制到 muse-matrix。
 
-编写 P0 时重点把控 3 个工程细节：
+编写 P0 时重点把控 4 个工程细节：
 1. 零依赖兼容 scripts/sync.mjs：sync 只复制 lib/service/mcp/panel + package.json/icon.svg/README.md，不同步 node_modules；Node v24 不允许裸 require('undici')（已实测 MODULE_NOT_FOUND，内部版本 7.30.1 但不暴露）。二选一：
    A) vendor 无依赖的 undici 到 vendor/undici，sync.mjs 的 COPY_DIRS 增加 'vendor'，代码 require('../vendor/undici')；
    B) 零依赖 fetch shim（node:http/https/net/tls 实现 CONNECT 隧道 + fetch 兼容子集）。
@@ -251,6 +289,7 @@ Instabox 扩展与 Muse 扩展是**两个独立的 OpenChamber 扩展**，由宿
 2. sing-box 入站用 "type":"mixed"：127.0.0.1:24001..24250 单端口同时支持 HTTP CONNECT 与 SOCKS5；Node 统一按 http://127.0.0.1:24xxx 调用。已用 sing-box 1.14.4 check 通过。
 3. 换节点/熔断时销毁连接池：slotPort 变更、节点热替换、failClosed 触发时，先 destroy()/close() 该账号 Agent/Dispatcher，中止在途请求（AbortController），完成后才允许恢复。
    REST 请求统一用干净的 apiPersona：不伪造与 Node TLS 指纹冲突的 Sec-CH-UA，不发无效的 Timezone 头。
+4. 通用模块零反向依赖 + 共享 sing-box：store-lock / proxy-fetch / sub2port / scheduler / inventory-probe / ratelimit 内部不得 require('./instabox')、不得硬编码 api.instabox.sh / ibk_ / m_；singBoxBin 按 settings → PROXYGATE_SINGBOX → SINGBOX_BIN → 共享 shardx 路径 → 扩展 bin → PATH 解析；共享池用 data/singbox-<basePort>.lock 保证单实例所有者。
 
 完成 P0 代码与 node --test 后，同步安装目录并用单账号实测汇报：
 1. Sub2Port 绑定 :24001 时，出口 IP 严格等于代理节点 IP；
