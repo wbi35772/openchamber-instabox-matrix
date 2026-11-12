@@ -223,5 +223,5 @@ async function tickEntries(entries, deps) {
 ## 10. 交付状态
 
 - 代码：已提交 `3655d09` 并推送 `main`；`node --test` 106/106 通过。
-- 安装副本：已同步至开发版本，`scripts/sync.mjs --check` 仅剩 registry 标记项。
+- 安装副本：已执行 `scripts/sync.mjs`（1 更新 / 1 删除），`--check` 输出 `everything matches`；重启 OpenChamber 后加载新版。
 - 本报告同步存放于仓库 `docs/MULTI-ACCOUNT-ASSESSMENT.md`。
