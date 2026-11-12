@@ -10,7 +10,7 @@ const inventoryProbe = require('../lib/inventory-probe');
 const { createAccountProxy } = require('../lib/account-proxy');
 const { createRateLimiter } = require('../lib/ratelimit');
 const { createScheduler } = require('../lib/scheduler');
-const { machineUptime } = require('../lib/uptime');
+const { machineUptime, cooldownInfo } = require('../lib/uptime');
 
 const SERVER_NAME = 'instabox-matrix';
 const SERVER_VERSION = '1.3.0';
@@ -483,13 +483,16 @@ async function listMachines(args) {
           ? `${ka.mode || 'lease'}${ka.expiresAt ? ` → ${new Date(ka.expiresAt).toISOString().slice(11, 16)}Z` : ''}${ka.lastOk === false ? ' ⚠' : ''}`
           : '—';
         const uptime = machineUptime(m);
-        return `| ${m.id} | ${m.name || ''} | ${stateLabel(m)} | ${uptime ? uptime.text : '—'} | ${machineSpec(m)} | ${m.template ? `${m.template.id} ${m.template.version}` : '—'} | ${m.autoSuspendAfterSeconds === null ? 'off' : `${m.autoSuspendAfterSeconds}s`} | ${kaText} |`;
+        const cd = cooldownInfo(m);
+        const cdText = cd ? `${new Date(cd.until).toISOString().slice(11, 16)}Z` : '—';
+        const maxRun = Number.isFinite(Number(m.maxRunMinutes)) ? `${m.maxRunMinutes}分` : '不限';
+        return `| ${m.id} | ${m.name || ''} | ${stateLabel(m)} | ${uptime ? uptime.text : '—'} | ${machineSpec(m)} | ${m.template ? `${m.template.id} ${m.template.version}` : '—'} | ${m.autoSuspendAfterSeconds === null ? 'off' : `${m.autoSuspendAfterSeconds}s`} | ${maxRun} | ${cdText} | ${kaText} |`;
       });
       blocks.push([
         header,
         '',
-        '| ID | 名称 | 状态 | 连续运行 | 规格 | 模板 | 空闲暂停 | Keepalive |',
-        '| --- | --- | --- | --- | --- | --- | --- | --- |',
+        '| ID | 名称 | 状态 | 连续运行 | 规格 | 模板 | 空闲暂停 | 最长运行 | 冷却至 | Keepalive |',
+        '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
         ...rows,
       ].join('\n'));
     } catch (error) {

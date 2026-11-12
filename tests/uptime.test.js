@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { runStartedAt, formatUptime, machineUptime } = require('../lib/uptime');
+const { runStartedAt, formatUptime, machineUptime, cooldownInfo } = require('../lib/uptime');
 
 const NOW = Date.parse('2026-11-07T15:31:00.000Z');
 
@@ -47,4 +47,16 @@ test('machineUptime returns null without a trustworthy start or when down', () =
   assert.equal(machineUptime({ state: 'running', runStartedAt: 'not-a-date' }, NOW), null);
   assert.equal(machineUptime({ state: 'suspended', runStartedAt: '2026-11-07T10:00:00Z' }, NOW), null);
   assert.equal(machineUptime({ state: 'running', runStartedAt: '2026-11-07T16:00:00Z' }, NOW).text, '0秒');
+});
+
+test('cooldownInfo reports only an active cooldown', () => {
+  const active = cooldownInfo({ cooldownUntil: '2026-11-07T15:40:00Z' }, NOW);
+  assert.equal(active.until, '2026-11-07T15:40:00Z');
+  assert.equal(active.remainingMs, 9 * 60 * 1000);
+
+  assert.equal(cooldownInfo({ cooldownUntil: '2026-11-07T15:31:00Z' }, NOW), null);
+  assert.equal(cooldownInfo({ cooldownUntil: '2026-11-07T15:00:00Z' }, NOW), null);
+  assert.equal(cooldownInfo({ cooldownUntil: 'not-a-date' }, NOW), null);
+  assert.equal(cooldownInfo({}, NOW), null);
+  assert.equal(cooldownInfo(null, NOW), null);
 });

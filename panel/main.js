@@ -228,6 +228,20 @@
     return date.toISOString().replace('T', ' ').replace(/\.\d+Z$/, 'Z');
   }
 
+  function cooldownOf(machine) {
+    var raw = machine && machine.cooldownUntil;
+    if (!raw) return null;
+    var until = new Date(raw).getTime();
+    if (!Number.isFinite(until) || until <= Date.now()) return null;
+    return { until: raw, ms: until - Date.now() };
+  }
+
+  function fmtCooldown(machine) {
+    var cd = cooldownOf(machine);
+    if (!cd) return '—';
+    return String(cd.until).slice(11, 16) + 'Z · ' + fmtUptime(cd.ms);
+  }
+
   function fmtRate(bytes) {
     return fmtBytes(Number(bytes || 0)) + '/s';
   }
@@ -778,6 +792,7 @@
       kaStatus.push('累计 ' + (Number(keepalive.runs) || 0) + ' 次');
       if (keepalive.lastError) kaStatus.push('错误: ' + String(keepalive.lastError).slice(0, 90));
     }
+    var cooldown = cooldownOf(machine);
 
     return [
       '<article class="card state-' + tone + '" data-machine="' + esc(machine.id) + '" data-account="' + esc(machine.account) + '">',
@@ -795,6 +810,7 @@
       metaItem('数据盘', diskText(machine)),
       metaItem('空闲暂停', fmtDuration(machine.autoSuspendAfterSeconds), machine.autoSuspendAfterSeconds ? 'warn' : ''),
       metaItem('最长运行', fmtMinutes(machine.maxRunMinutes)),
+      cooldown ? metaItem('冷却至', fmtCooldown(machine), 'bad') : '',
       metaItem('连续运行', uptime ? fmtUptime(uptime.ms) : '—', uptime ? 'ok' : ''),
       metaItem('快照序号', machine.storage && machine.storage.snapshotSeq != null ? '#' + machine.storage.snapshotSeq : '—'),
       '</div>',
@@ -1419,6 +1435,7 @@
       metaItem('本次启动', uptimeDetail ? fmtDate(uptimeDetail.startedAt) : '—'),
       metaItem('创建时间', fmtDate(machine.createdAt)),
     ];
+    if (cooldownOf(machine)) rows.push(metaItem('冷却至', fmtCooldown(machine), 'bad'));
     var ka = machine.keepalive || null;
     var kaCooling = Boolean(ka && ka.retryAt && Date.parse(ka.retryAt) > Date.now());
     var kaMode = ka && ka.enabled
@@ -2621,10 +2638,12 @@
       items.forEach(function (item) {
         var machine = item.machine;
         var meta = item.meta;
+        var cd = cooldownOf(machine);
+        var stateText = (machine.state || 'unknown') + (cd ? ' · 冷却至 ' + String(cd.until).slice(11, 16) + 'Z' : '');
         body.push([
           '<div class="matrix-row" data-account="' + esc(machine.account) + '" data-machine="' + esc(machine.id) + '">',
           '<label class="matrix-pick"><input type="checkbox" data-matrix-pick data-state="' + esc(machine.state || '') + '" data-account="' + esc(machine.account) + '" data-machine="' + esc(machine.id) + '"' + (machine.state === 'running' ? ' checked' : '') + ' /></label>',
-          '<div class="matrix-id"><strong>' + esc(machine.name || machine.id) + '</strong><span>' + esc(machine.id) + ' · ' + esc(machine.account) + ' · ' + esc(machine.state || 'unknown') + '</span></div>',
+          '<div class="matrix-id"><strong>' + esc(machine.name || machine.id) + '</strong><span>' + esc(machine.id) + ' · ' + esc(machine.account) + ' · ' + esc(stateText) + '</span></div>',
           '<input class="input mono matrix-input" data-meta="group" placeholder="分组" value="' + esc(meta.projectGroup || '') + '" />',
           '<input class="input mono matrix-input" data-meta="role" placeholder="角色" value="' + esc(meta.role || '') + '" />',
           '<input class="input mono matrix-input" data-meta="tags" placeholder="a,b" value="' + esc((meta.tags || []).join(',')) + '" />',
