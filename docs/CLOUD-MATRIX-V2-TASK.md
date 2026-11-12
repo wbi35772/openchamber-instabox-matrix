@@ -366,6 +366,26 @@ curl -sS -x http://127.0.0.1:24001 https://api.ipify.org --max-time 5
 - 硬线 1（出口 IP == 节点 IP）不成立：同一端口连续 3 次出口为 `185.17.122.89` / 证书错误 / `82.21.117.93`；24002 为 `37.220.82.145` → `167.99.246.140` → `46.249.99.199`。该订阅是轮换出口/中转，不是固定节点，不能用「等于节点 IP」判定。可复现结论：流量确实经代理（≠ 本机 `1.196.187.141`），但出口随机。
 - 该轮换订阅不用于硬线 1；固定节点复测见下节。
 
+## 节点参数：全部来自配置，无写死
+
+- 存储：`settings.proxy.nodes = { "<alias>": "<uri>" }`，每条 URI 自带 `protocol/server/port/uuid|password|method/path/host/sni/tls`；`normalizeProxySettings` 只校验格式，不补默认节点。
+- 端口：`settings.proxy.ports[alias]` 优先，否则 `basePort + index`（别名排序）。
+- 启动：`node scripts/singbox-up.js` 读取以上配置生成 sing-box；`--base-port/--data-dir/--bin/--shared/--log-level/--dry-run` 均可覆盖。
+- 代码里没有任何节点地址、UUID、SNI 或路径常量；`lib/sub2port.js` 只做 URI 解析与配置生成。
+- 示例（占位符，实际值全部由使用者填）：
+```json
+"proxy": {
+  "enabled": true,
+  "basePort": 24001,
+  "size": 250,
+  "ports": { "ROLE_A": 24001, "ROLE_B": 24002 },
+  "nodes": {
+    "ROLE_A": "vless://UUID@HOST_A:443?type=ws&path=/PATH&security=tls&sni=SNI_A#A",
+    "ROLE_B": "trojan://PASSWORD@HOST_B:443?security=tls&sni=SNI_B#B"
+  }
+}
+```
+
 ## 固定节点复测：Instabox 8443（2026-11-12）
 
 节点：`vless://b94b…@8443-agq4uw3nnf2ckra45gcrdcoyf4.instabox.tech:443?type=ws&path=/proxy`（用户自有）。

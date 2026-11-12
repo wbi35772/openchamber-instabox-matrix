@@ -94,6 +94,24 @@ test('emits ws transport with path and Host header', () => {
   });
 });
 
+test('builds explicit per-alias ports instead of sequential ones', () => {
+  const nodes = parseSubscription([
+    'vless://u1@1.1.1.1:443?security=tls&sni=a.example#A',
+    'trojan://p2@2.2.2.2:443?security=tls&sni=b.example#B',
+  ].join('\n'));
+  const built = buildSingBoxConfig(nodes, { basePort: 24001, ports: [25001, 25009] });
+  assert.deepEqual(built.config.inbounds.map((inbound) => inbound.listen_port), [25001, 25009]);
+  assert.deepEqual(built.config.route.rules.map((rule) => rule.inbound), [['slot-25001'], ['slot-25009']]);
+});
+
+test('rejects duplicate explicit ports', () => {
+  const nodes = [
+    { tag: 'a', protocol: 'vless', server: '1.1.1.1', port: 443, auth: { uuid: 'u' }, tls: { enabled: false } },
+    { tag: 'b', protocol: 'vless', server: '2.2.2.2', port: 443, auth: { uuid: 'u' }, tls: { enabled: false } },
+  ];
+  assert.throws(() => buildSingBoxConfig(nodes, { ports: [25001, 25001] }), /unique/);
+});
+
 test('rejects more nodes than the configured pool size', () => {
   const nodes = [
     { tag: 'a', protocol: 'vless', server: '1.1.1.1', port: 443, auth: { uuid: 'u' }, tls: { enabled: false } },
