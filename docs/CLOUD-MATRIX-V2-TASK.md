@@ -348,3 +348,12 @@ curl -sS -x http://127.0.0.1:24001 https://api.ipify.org
 curl -sS -x http://127.0.0.1:24001 https://api.ipify.org --max-time 5
 ```
 
+## P1 接线记录（2026-11-12）
+
+- `lib/store.js`：新增 `PROXY_DEFAULTS` + `normalizeProxySettings` + `update()`（`withStateLock` 包住 load/mutate/save，mutator 返回 false 不落盘）；`save()` 改用 `atomicWriteFile`。
+- `lib/account-proxy.js`：alias → 端口（`ports[alias]` 优先，否则按启用账号 alias 排序取 `basePort + index % size`）；懒建/缓存/换端口自动重建；`status` / `release` / `closeAll` / `probe`。
+- `service/main.js`：`clientForAccount` 注入 `proxies.fetchFor(alias)`；`/api/settings` 接受 `proxy` 并 `closeAll()`；新增 `/api/proxy/status`、`/api/proxy/release`、`/api/proxy/probe`；shutdown 时 `closeAll()`。
+- `mcp/server.js`：MCP 工具走同一代理层，与面板服务共用端口。
+- 验证：146/146 单测通过；真实 service 冒烟（临时 dataDir + 假网关 + 假 HTTP 代理）→ `/api/overview` 200、网关命中 3 次、`/api/proxy/status` 端口一致。
+- 未执行：真实订阅节点出口 IP、停代理后零直连两条硬验收（当前无可用订阅）。
+

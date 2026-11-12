@@ -6,6 +6,7 @@ const { InstaboxClient, InstaboxError } = require('../lib/instabox');
 const { createKeepalive } = require('../lib/keepalive');
 const { createNetProbe } = require('../lib/netprobe');
 const inventory = require('../lib/inventory');
+const { createAccountProxy } = require('../lib/account-proxy');
 const { machineUptime } = require('../lib/uptime');
 
 const SERVER_NAME = 'instabox-matrix';
@@ -78,7 +79,9 @@ function resolveAccount(state, alias) {
 }
 
 function client(account, state) {
-  return InstaboxClient.fromAccount(account, state.settings);
+  return InstaboxClient.fromAccount(account, state.settings, {
+    fetchImpl: proxies.fetchFor(account.alias),
+  });
 }
 
 async function resolveMachineId(api, value) {
@@ -97,6 +100,7 @@ async function resolveMachineId(api, value) {
 }
 
 const netprobe = createNetProbe();
+const proxies = createAccountProxy({ getState: () => store.load(), log });
 
 const TOOLS = [
   {

@@ -9,6 +9,7 @@ const { createJobs } = require('../lib/jobs');
 const { createNetProbe } = require('../lib/netprobe');
 const inventory = require('../lib/inventory');
 const { createTerminalManager } = require('../lib/terminal');
+const { createAccountProxy } = require('../lib/account-proxy');
 
 const PORT = Number(process.env.OPENCHAMBER_SERVICE_PORT || 0);
 const TOKEN = String(process.env.OPENCHAMBER_SERVICE_TOKEN || '');
@@ -29,6 +30,7 @@ const keepalive = createKeepalive({ log });
 const jobs = createJobs();
 const netprobe = createNetProbe();
 const terminals = createTerminalManager({ log });
+const proxies = createAccountProxy({ getState: () => store.load(), log });
 const portCache = new Map();
 const inventoryCache = new Map();
 
@@ -105,8 +107,14 @@ function selectedAccounts(state, requested) {
   return active ? [active] : [];
 }
 
+function clientForAccount(account, state) {
+  return InstaboxClient.fromAccount(account, state.settings, {
+    fetchImpl: proxies.fetchFor(account.alias),
+  });
+}
+
 function clientFor(state, alias) {
-  return InstaboxClient.fromAccount(store.findAccount(state, alias), state.settings);
+  return clientForAccount(store.findAccount(state, alias), state);
 }
 
 function keepaliveFor(state, alias, machineId) {
@@ -141,7 +149,7 @@ async function probeBatch(targets, force) {
 async function overview(state, requested) {
   const accounts = selectedAccounts(state, requested);
   const results = await Promise.all(accounts.map(async (account) => {
-    const client = InstaboxClient.fromAccount(account, state.settings);
+    const client = clientForAccount(account, state);
     try {
       const [machines, usage, snapshots] = await Promise.all([
         client.listMachines(),
@@ -268,8 +276,31 @@ async function route(req, res, url) {
     if (body.defaultKeepaliveSeconds !== undefined) {
       state.settings.defaultKeepaliveSeconds = Math.max(30, Math.min(3600, Number(body.defaultKeepaliveSeconds) || 240));
     }
+    if (body.proxy !== undefined) {
+      state.settings.proxy = store.normalizeProxySettings(body.proxy);
+    }
     store.save(state);
+    proxies.closeAll();
     return send(res, 200, { ok: true, settings: state.settings });
+  }
+
+  if (method === 'GET' && path === '/api/proxy/status') {
+    return send(res, 200, { ok: true, proxy: proxies.status(), settings: store.load().settings.proxy });
+  }
+
+  if (method === 'POST' && path === '/api/proxy/release') {
+    const body = await readBody(req);
+    proxies.release(body.alias ? String(body.alias) : '');
+    return send(res, 200, { ok: true, proxy: proxies.status() });
+  }
+
+  if (method === 'POST' && path === '/api/proxy/probe') {
+    const body = await readBody(req);
+    const state = store.load();
+    const accounts = selectedAccounts(state, body.account || '');
+    if (!accounts.length) throw new InstaboxError('没有可用账号', { code: 'no_account', status: 400 });
+    const results = await Promise.all(accounts.map((account) => proxies.probe(account.alias)));
+    return send(res, 200, { ok: results.every((item) => item.ok), results });
   }
 
   if (method === 'POST' && path === '/api/test') {
@@ -382,7 +413,7 @@ async function route(req, res, url) {
       : null;
     const targets = [];
     for (const account of accounts) {
-      const client = InstaboxClient.fromAccount(account, state.settings);
+      const client = clientForAccount(account, state);
       let machines;
       try {
         machines = await client.listMachines();
@@ -428,7 +459,7 @@ async function route(req, res, url) {
     const accounts = selectedAccounts(state, query.account || '');
     const data = await Promise.all(accounts.map(async (account) => {
       try {
-        return { alias: account.alias, ok: true, usage: await InstaboxClient.fromAccount(account, state.settings).usage() };
+        return { alias: account.alias, ok: true, usage: await clientForAccount(account, state).usage() };
       } catch (error) {
         return { alias: account.alias, ok: false, error: { code: error.code, message: error.message } };
       }
@@ -441,7 +472,7 @@ async function route(req, res, url) {
     const accounts = selectedAccounts(state, query.account || '');
     const data = await Promise.all(accounts.map(async (account) => {
       try {
-        return { alias: account.alias, ok: true, snapshots: await InstaboxClient.fromAccount(account, state.settings).listSnapshots() };
+        return { alias: account.alias, ok: true, snapshots: await clientForAccount(account, state).listSnapshots() };
       } catch (error) {
         return { alias: account.alias, ok: false, error: { code: error.code, message: error.message } };
       }
@@ -457,7 +488,7 @@ async function route(req, res, url) {
         return {
           alias: account.alias,
           ok: true,
-          templates: await InstaboxClient.fromAccount(account, state.settings).templates(),
+          templates: await clientForAccount(account, state).templates(),
         };
       } catch (error) {
         return { alias: account.alias, ok: false, templates: [], error: { code: error.code, message: error.message } };
@@ -480,7 +511,7 @@ async function route(req, res, url) {
     for (const key of keys) {
       if (body[key] !== undefined && body[key] !== null && body[key] !== '') payload[key] = body[key];
     }
-    const operation = await InstaboxClient.fromAccount(account, state.settings).createMachine(payload);
+    const operation = await clientForAccount(account, state).createMachine(payload);
     return send(res, 202, { ok: true, operationId: operation.id, operation });
   }
 
@@ -839,6 +870,7 @@ function shutdown() {
   shuttingDown = true;
   keepalive.stop();
   terminals.closeAll();
+  proxies.closeAll();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 2000).unref();
 }
