@@ -407,3 +407,11 @@ curl -sS -x http://127.0.0.1:24001 https://api.ipify.org --max-time 5
 - 验证：`node --test` 159/159 通过（新增 `tests/matrix-p2.test.js` 5 例）；`tools/list` 出现三个 `matrix_*` 工具；`matrix_tag list` 空态文案正确。
 - 现场限制：10:14 实测 `matrix_inventory_summary` 时机器 `proxygate` 处于 `suspended`，节点对 ws 返回 HTTP 409 → 我们的 `TLS upgrade failed: read ECONNRESET`；直连 API 确认 `state=suspended`，免费计划冷却至 `2026-11-12T18:58:53Z` 才能唤醒。属机器状态，不是代理层或代码缺陷。
 
+## 面板矩阵看板（2026-11-12）
+
+- 入口：顶栏「矩阵」按钮（`data-act="matrix"`），弹层内按 `projectGroup` 折叠，逐台显示状态、规格、分组/角色、标签。
+- 编辑：每台可改 `projectGroup`、`role`、`tags`（逗号分隔）、`notes`，保存走 `PUT /api/matrix/meta`；`GET /api/matrix` 返回元数据列表。
+- 批量：勾选机器后输入命令 + 并发/超时，面板内并发调用各自 `/api/machines/:id/exec` 并轮询 job 结果，逐台展示 stdout/stderr/exitCode；筛选与元数据复用同一套 `machineMeta`。
+- 服务实测（测试实例 `:47991`，`OPENCHAMBER_SERVICE_TOKEN`）：`/health` ok；`GET /api/matrix` → `{ok:true,meta:[]}`；`PUT /api/matrix/meta` 写入 `proxygate/exit/#prod #exit` 成功并可回读；无 token 返回 401。
+- 已验证 `matrix_tag list/set` 在安装副本上可用（tag 回显 `proxygate · exit · #prod #exit`）。
+
