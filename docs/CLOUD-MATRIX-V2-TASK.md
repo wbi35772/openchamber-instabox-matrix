@@ -330,3 +330,21 @@ const tlsSocket = tls.connect({
 
 1. `Sub2Port` 绑定 `:24001` 时，请求观测到的出口 IP **严格等于**代理节点 IP，且 ≠ 宿主机 IP。
 2. 手动停掉 `:24001` 且 `failClosed:true` 时，该账号一切 API / keepalive 请求立即失败；状态进入 `quarantined`，在途请求被 `AbortController` 中止，**零直连回退**（可用宿主侧 tcpdump / 连接表验证目标域无直连）。
+
+## P0 验证记录（2026-11-12）
+
+- `node --test`：138/138 通过（新增 6 个模块 + 6 个测试文件）。
+- `sing-box 1.14.4 check`：vless + trojan 的 mixed 配置校验 exit 0。
+- 端到端端口映射：mixed `:24099` → socks5 outbound → 本地 SOCKS5 → HTTP 目标，`curl -x http://127.0.0.1:24099` 返回 `hello-through-singbox`。
+- 端到端 TLS：`createProxyFetch(24099).fetch('https://example.com/')` → HTTP 200，577 bytes（CONNECT + 显式 SNI 生效）。
+- 两条硬验收线（真实节点出口 IP / 停代理后零直连）本轮**未执行**：当前会话没有可用订阅与真实节点；命令见下。
+
+```bash
+# 1) 用真实订阅起引擎（先放入 SUB_FILE）
+node scripts/sub2port-serve.js SUB_FILE --base-port 24001 --bin /path/to/sing-box
+# 2) 硬验收线 1：出口 IP 必须等于节点 IP
+curl -sS -x http://127.0.0.1:24001 https://api.ipify.org
+# 3) 硬验收线 2：停掉引擎后必须立即失败，且无直连
+curl -sS -x http://127.0.0.1:24001 https://api.ipify.org --max-time 5
+```
+
