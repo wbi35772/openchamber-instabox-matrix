@@ -89,6 +89,49 @@
 
 ---
 
+## 模块 2.5：P0 运行时三个暗坑（已实测，必读）
+
+### 2.5.1 `undici` 不可裸引用（已实测）
+
+- 实测：`require.resolve('undici')` → `MODULE_NOT_FOUND`；`import('undici')` → `ERR_MODULE_NOT_FOUND`；`require.resolve('node:undici')` → `MODULE_NOT_FOUND`。
+- Node 内部确实捆绑了 undici（`process.versions.undici = 7.30.1`），但**不对外暴露**。
+- `scripts/sync.mjs` 只复制 `COPY_FILES = ['package.json','icon.svg','README.md']` 与 `COPY_DIRS = ['lib','service','mcp','panel']`，**不同步 `node_modules`**。直接 `require('undici')` 在安装目录必炸。
+
+两种解法（二选一，必须显式选）：
+
+**解法 A：vendor undici（推荐）**
+- 把无依赖的 `undici` 包放到 `vendor/undici/`，代码内 `require('../vendor/undici')`；
+- 在 `scripts/sync.mjs` 的 `COPY_DIRS` 增加 `'vendor'`；
+- 优点：功能完整（Dispatcher / ProxyAgent / redirect / abort），无需本地编译；
+- 成本：仓库增加约 2 MB。
+
+**解法 B：零依赖 fetch shim**
+- 用 `node:http` + `node:https` + `node:net` + `node:tls` 实现 `lib/proxy-fetch.js`，导出 `createProxyFetch(port)`，作为 `fetchImpl` 注入；
+- 必须返回 fetch 兼容对象：`{ ok, status, statusText, headers.get(name), text(), json(), arrayBuffer() }`；
+- HTTPS 走 `CONNECT host:443` → `tls.connect({ socket })`；HTTP 走绝对 URI；
+- **注意**：Node 的 `globalThis.fetch` 不接受 `http.Agent`；`dispatcher` 选项需要 undici 的 Dispatcher 实例，零依赖下拿不到。所以解法 B 不是「给 fetch 加 Agent」，而是「重写一个 fetch 子集」，约 120–160 行，不是 40 行。
+
+> P0 默认选 A；若坚持零依赖选 B，并把支持的方法/头部/重定向范围写进测试。
+
+### 2.5.2 sing-box 入站用 `mixed`（已实测）
+
+- 实测 sing-box 1.14.4（`projects/proxygate-matrix/proxygate-nodes/shardx/sing-box.exe`）对同时含 `mixed` + `http` inbound 的配置执行 `sing-box check` → **exit 0**。
+- `mixed` 在同一端口按首字节自动识别 HTTP CONNECT 与 SOCKS5：
+  - Node 用 `http://127.0.0.1:24001`；
+  - SSH/隧道用 `socks5h://127.0.0.1:24001`；
+- 端口段因此只需 `24001..24250`，取消 `25001+` 备用段。
+
+### 2.5.3 换节点/熔断必须销毁连接池
+
+- 代理客户端默认 `keepAlive`，重绑端口或触发 `failClosed` 后，空闲长连接仍可能复用数秒，等于「熔断后仍走旧出口」。
+- 要求：
+  - 每次 `slotPort` 变更、节点热替换、Kill-Switch 时，先 `destroy()`/`close()` 该账号缓存的 Agent/Dispatcher；
+  - 中止该账号在途请求（`AbortController`）；
+  - 解法 B 的 shim 需自行跟踪 socket 集合并统一 `destroy()`；
+  - 销毁完成后才允许该账号恢复请求。
+
+---
+
 ## 模块 3：身份一致性与调度（`lib/persona.js`、`lib/scheduler.js`）
 
 ### 3.1 先抓包，后生成
@@ -158,3 +201,31 @@
 3. `node scripts/sync.mjs` 同步安装目录，`--check` 一致。
 4. 更新 `docs/MULTI-ACCOUNT-ASSESSMENT.md` 为 v2.0 架构说明，并新增 `docs/CLOUD-MATRIX-V2.md`（本任务书）。
 5. 先做 P0（模块 1 + 2 + fetch 注入），单账号验证「出口 IP = 节点 IP、断代理即失败」，再继续 P1/P2。
+
+---
+
+## P0 启动指令（可直接粘贴）
+
+```text
+请读取仓库最新提交下的两份设计文档：
+- docs/CLOUD-MATRIX-V2-TASK.md
+- docs/CLOUD-MATRIX-V2-REVIEW.md
+
+只聚焦落地 P0 的三件事：
+1. 原子存储与状态锁（lib/store.js + Node 24 内置 node:sqlite WAL，PRAGMA busy_timeout=5000）+ Provider 抽象（lib/providers/）；
+2. Sub2Port 本地端口映射引擎（lib/sub2port.js）；
+3. 每账号代理注入与 failClosed 断流熔断（Kill-Switch）。
+
+编写 P0 时重点把控 3 个工程细节：
+1. 零依赖兼容 scripts/sync.mjs：sync 只复制 lib/service/mcp/panel + package.json/icon.svg/README.md，不同步 node_modules；Node v24 不允许裸 require('undici')（已实测 MODULE_NOT_FOUND，内部版本 7.30.1 但不暴露）。二选一：
+   A) vendor 无依赖的 undici 到 vendor/undici，sync.mjs 的 COPY_DIRS 增加 'vendor'，代码 require('../vendor/undici')；
+   B) 零依赖 fetch shim（node:http/https/net/tls 实现 CONNECT 隧道 + fetch 兼容子集）。
+   注意：globalThis.fetch 不接受 http.Agent，不要写「40 行 Agent」。
+2. sing-box 入站用 "type":"mixed"：127.0.0.1:24001..24250 单端口同时支持 HTTP CONNECT 与 SOCKS5；Node 统一按 http://127.0.0.1:24xxx 调用。已用 sing-box 1.14.4 check 通过。
+3. 换节点/熔断时销毁连接池：slotPort 变更、节点热替换、failClosed 触发时，先 destroy()/close() 该账号 Agent/Dispatcher，中止在途请求（AbortController），完成后才允许恢复。
+   REST 请求统一用干净的 apiPersona：不伪造与 Node TLS 指纹冲突的 Sec-CH-UA，不发无效的 Timezone 头。
+
+完成 P0 代码与 node --test 后，同步安装目录并用单账号实测汇报：
+1. Sub2Port 绑定 :24001 时，出口 IP 严格等于代理节点 IP；
+2. 手动停掉 :24001 且 failClosed:true 时，该账号 API / Keepalive 立即熔断失败，100% 不回退宿主机直连 IP。
+```

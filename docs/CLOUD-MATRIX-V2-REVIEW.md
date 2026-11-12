@@ -150,3 +150,22 @@ Node fetch ──TLS(端到端)──> api.instabox.sh
 - [ ] 100 个账号的 keepalive 时间戳分布在一个周期内近似均匀（无同秒脉冲）。
 - [ ] `node --test` 覆盖：原子锁、端口映射配置生成、persona 确定性、调度相位、栈解析，全绿。
 - [ ] `sync.mjs --check` 一致。
+
+---
+
+## 6. P0 运行时实测补充（2026-11-12）
+
+| 检查 | 结果 |
+| --- | --- |
+| `require.resolve('undici')` | `MODULE_NOT_FOUND` |
+| `import('undici')` | `ERR_MODULE_NOT_FOUND` |
+| `require.resolve('node:undici')` | `MODULE_NOT_FOUND` |
+| `process.versions.undici` | `7.30.1`（内部捆绑，不暴露） |
+| `scripts/sync.mjs` 复制范围 | `package.json icon.svg README.md` + `lib/ service/ mcp/ panel/`，**无 `node_modules`** |
+| sing-box 1.14.4 对 `mixed` + `http` inbound 的 `check` | **exit 0**（`projects/proxygate-matrix/proxygate-nodes/shardx/sing-box.exe`） |
+
+结论：
+- 裸 `require('undici')` 在安装目录不可用 → 必须 vendor 或写 fetch shim。
+- Node 的 `globalThis.fetch` 不接受 `http.Agent`；`dispatcher` 需要 undici 实例 → 零依赖方案是「重写 fetch 子集」，不是「给 fetch 加 Agent」。
+- `mixed` inbound 同时吃 HTTP CONNECT 与 SOCKS5，端口段只保留 `24001..24250`。
+- 换节点/熔断必须销毁缓存的连接池并中止在途请求，否则旧出口会继续复用数秒。
